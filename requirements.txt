@@ -1,0 +1,2 @@
+python-telegram-bot[job-queue]==22.5
+asyncpg==0.30.0
