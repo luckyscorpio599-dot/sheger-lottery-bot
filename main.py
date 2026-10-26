@@ -955,5 +955,103 @@ def main():
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
+async def health_check(request):
+    return web.Response(text="Sheger Lottery Bot is running")
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.environ.get("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info("Web server started on port %s", port)
+
+
+async def run_bot():
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("settings", settings_menu))
+    application.add_handler(CommandHandler("set", set_command))
+    application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CommandHandler("blockuser", block_user_command))
+    application.add_handler(CommandHandler("unblockuser", unblock_user_command))
+    application.add_handler(CommandHandler("blocknumber", block_number_command))
+    application.add_handler(CommandHandler("unblocknumber", unblock_number_command))
+    application.add_handler(CommandHandler("blockednumbers", blocked_numbers_command))
+    application.add_handler(CommandHandler("pendingpayments", pending_payments_command))
+
+    application.add_handler(
+        CallbackQueryHandler(
+            buy_type_callback,
+            pattern=r"^buy:(full|half)$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            payment_review_callback,
+            pattern=r"^pay:(approve|reject):\d+$",
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO | filters.Document.IMAGE,
+            handle_receipt,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_router,
+        )
+    )
+
+    try:
+        await application.initialize()
+        await post_init(application)
+        await application.start()
+
+        if application.updater is None:
+            raise RuntimeError("Telegram updater is unavailable")
+
+        await application.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES
+        )
+
+        log.info("Telegram bot polling started")
+        await asyncio.Event().wait()
+
+    finally:
+        if application.updater is not None and application.updater.running:
+            await application.updater.stop()
+
+        if application.running:
+            await application.stop()
+
+        await post_shutdown(application)
+        await application.shutdown()
+
+
+async def main_async():
+    await asyncio.gather(
+        start_web_server(),
+        run_bot(),
+    )
+
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_async())
