@@ -1,0 +1,1 @@
+# sheger-lottery-bot
