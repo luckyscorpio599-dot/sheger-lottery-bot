@@ -274,6 +274,20 @@ def init_db():
         }
         if "ticket_code" not in payment_columns:
             db.execute("ALTER TABLE payments ADD COLUMN ticket_code TEXT")
+        if "ticket_type" not in payment_columns:
+            # Older PostgreSQL databases may predate the ticket_type column.
+            # Add it without dropping or replacing existing payment records.
+            db.execute("ALTER TABLE payments ADD COLUMN ticket_type TEXT")
+            db.execute(
+                """
+                UPDATE payments
+                SET ticket_type = CASE
+                    WHEN ticket_code = 'half' THEN 'ግማሽ'
+                    ELSE 'ሙሉ'
+                END
+                WHERE ticket_type IS NULL OR ticket_type = ''
+                """
+            )
         db.executemany(
             """
             INSERT OR IGNORE INTO bot_settings (setting_key, setting_value)
