@@ -14,7 +14,7 @@ import os
 import re
 import secrets
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import DictCursor
 
 from telegram import (
     CopyTextButton,
@@ -122,7 +122,15 @@ class DatabaseConnection:
 
     @staticmethod
     def _sql(query):
+        # Translate the small set of SQLite SQL forms used by the bot to PostgreSQL.
         query = query.replace("?", "%s")
+        query = re.sub(r"\bBEGIN\s+IMMEDIATE\b", "BEGIN", query, flags=re.IGNORECASE)
+        query = re.sub(
+            r"GROUP_CONCAT\(([^)]+)\)",
+            r"STRING_AGG(CAST(\1 AS TEXT), ',')",
+            query,
+            flags=re.IGNORECASE,
+        )
         ignored = query.lstrip().upper().startswith("INSERT OR IGNORE")
         if ignored:
             query = query.replace("INSERT OR IGNORE", "INSERT", 1)
@@ -130,17 +138,17 @@ class DatabaseConnection:
         return query
 
     def execute(self, query, params=None):
-        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        cursor = self.connection.cursor(cursor_factory=DictCursor)
         cursor.execute(self._sql(query), params or ())
         return cursor
 
     def executemany(self, query, params):
-        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        cursor = self.connection.cursor(cursor_factory=DictCursor)
         cursor.executemany(self._sql(query), params)
         return cursor
 
     def executescript(self, script):
-        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        cursor = self.connection.cursor(cursor_factory=DictCursor)
         for statement in script.split(";"):
             if statement.strip():
                 cursor.execute(statement)
@@ -346,15 +354,30 @@ def init_db():
             ("legacy_tickets_to_slots_v1",),
         ).fetchone()
         if not legacy_migration:
-            legacy_rows = db.execute(
-                """
-                SELECT t.number, t.payment_id, t.user_id, t.assigned_at,
-                       p.ticket_code, p.ticket_type
-                FROM tickets t
-                JOIN payments p ON p.id = t.payment_id
-                ORDER BY p.id
-                """
-            ).fetchall()
+            # Older databases may have a legacy `tickets` table with a different
+            # layout. Only read it when every column required by this migration exists.
+            legacy_ticket_columns = {
+                row["column_name"]
+                for row in db.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = 'tickets'"
+                ).fetchall()
+            }
+            required_legacy_columns = {"number", "payment_id", "user_id", "assigned_at"}
+            if required_legacy_columns.issubset(legacy_ticket_columns):
+                legacy_rows = db.execute(
+                    """
+                    SELECT t.number, t.payment_id, t.user_id, t.assigned_at,
+                           p.ticket_code, p.ticket_type
+                    FROM tickets t
+                    JOIN payments p ON p.id = t.payment_id
+                    ORDER BY p.id
+                    """
+                ).fetchall()
+            else:
+                # No compatible legacy ticket schema exists. The current bot uses
+                # ticket_allocations; do not crash startup trying to migrate it.
+                legacy_rows = []
             for row in legacy_rows:
                 code = infer_ticket_code(
                     row["ticket_code"], row["ticket_type"], migration_settings
