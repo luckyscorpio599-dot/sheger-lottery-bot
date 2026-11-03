@@ -78,6 +78,12 @@ ADMIN_SETTING_FIELDS = {
     "half_ticket_price": ("💵 የግማሽ ዕጣ ዋጋ", "price"),
     "first_number": ("🔢 የመጀመሪያ ቁጥር", "number"),
     "last_number": ("🔢 የመጨረሻ ቁጥር", "number"),
+    "pending_payment_hours": ("⏳ Pending የክፍያ ጊዜ (ሰዓት)", "number"),
+    "draw_datetime": ("📅 የዕጣ ማውጫ ቀንና ሰዓት", "text"),
+    "draw_status": ("📌 የዕጣ ቀን ሁኔታ", "text"),
+    "public_sales_report": ("📊 ለተጠቃሚ የሚታይ የሽያጭ ሪፖርት", "text"),
+    "support_text": ("🆘 Support መረጃ", "text"),
+    "tutorial_text": ("📚 Tutorial ጽሑፍ", "text"),
 }
 
 
@@ -244,6 +250,7 @@ def init_db():
                 display_name TEXT NOT NULL,
                 phone_number TEXT NOT NULL,
                 username TEXT,
+                address TEXT,
                 registered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -296,6 +303,53 @@ def init_db():
                 WHERE ticket_type IS NULL OR ticket_type = ''
                 """
             )
+        payment_columns = {row["column_name"] for row in db.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='payments'"
+        ).fetchall()}
+        if "payment_method_id" not in payment_columns:
+            db.execute("ALTER TABLE payments ADD COLUMN payment_method_id BIGINT")
+        # Additive v3 schema: preserves existing users, payments and allocations.
+        user_columns = {row["column_name"] for row in db.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='users'"
+        ).fetchall()}
+        if "address" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN address TEXT")
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS payment_methods (
+                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, account TEXT NOT NULL DEFAULT '',
+                holder TEXT NOT NULL DEFAULT '', instruction TEXT NOT NULL DEFAULT '',
+                active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS user_profile_history (
+                id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, old_name TEXT, new_name TEXT,
+                old_phone TEXT, new_phone TEXT, old_address TEXT, new_address TEXT,
+                changed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS lottery_content (
+                content_key TEXT PRIMARY KEY, content_value TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS broadcast_log (
+                id BIGSERIAL PRIMARY KEY, admin_id BIGINT NOT NULL, body TEXT NOT NULL,
+                sent_count INTEGER NOT NULL DEFAULT 0, failed_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS admin_audit_log (
+                id BIGSERIAL PRIMARY KEY, admin_id BIGINT NOT NULL, action TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS lottery_draw_results (
+                id BIGSERIAL PRIMARY KEY, winning_number TEXT NOT NULL, announcement TEXT NOT NULL DEFAULT '',
+                admin_id BIGINT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        # v3 settings; expiry is intentionally admin-configurable.
+        for key, value in {
+            "pending_payment_hours": "24", "draw_datetime": "Not announced",
+            "draw_status": "ቀን ተወስኗል", "public_sales_report": "",
+            "support_text": "", "tutorial_text": "", "tutorial_file_id": "",
+            "tutorial_file_type": "", "report_target": "", "report_note": "",
+        }.items():
+            db.execute("INSERT OR IGNORE INTO bot_settings(setting_key,setting_value) VALUES (?,?)", (key,value))
         db.executemany(
             """
             INSERT OR IGNORE INTO bot_settings (setting_key, setting_value)
@@ -418,6 +472,45 @@ def get_settings():
     return settings
 
 
+def active_payment_methods():
+    with db_session() as db:
+        return db.execute("SELECT * FROM payment_methods WHERE active=TRUE ORDER BY id").fetchall()
+
+async def prompt_payment_method(message, context, ticket_code):
+    methods=active_payment_methods()
+    if methods:
+        rows=[[InlineKeyboardButton(m["name"],callback_data=f"paymethod:{m['id']}")] for m in methods]
+        await message.reply_text("የክፍያ አማራጭ ይምረጡ፦",reply_markup=InlineKeyboardMarkup(rows))
+        return
+    settings=get_settings()
+    if not bank_details_configured(settings):
+        await message.reply_text("የክፍያ መረጃው ገና አልተዘጋጀም። እባክዎ አድሚኑን ያነጋግሩ።")
+        return
+    context.user_data["payment_method_id"]=None
+    await message.reply_text(bank_info_text(settings,ticket_code),parse_mode="HTML",reply_markup=bank_info_keyboard(settings))
+
+async def payment_method_callback(update, context):
+    q=update.callback_query
+    if not await require_private_chat(update): return
+    if get_registered_user(q.from_user.id) is None:
+        await q.answer("መጀመሪያ ይመዝገቡ።",show_alert=True); return
+    try: mid=int((q.data or '').split(':',1)[1])
+    except (ValueError,IndexError): await q.answer(); return
+    with db_session() as db: method=db.execute("SELECT * FROM payment_methods WHERE id=? AND active=TRUE",(mid,)).fetchone()
+    if not method: await q.answer("ይህ የክፍያ አማራጭ አይገኝም።",show_alert=True); return
+    await q.answer()
+    context.user_data['payment_method_id']=mid
+    ticket_code=context.user_data.get('ticket_code')
+    if ticket_code not in {'full','half'}:
+        await q.message.reply_text("እባክዎ የዕጣ አይነት እንደገና ይምረጡ።"); return
+    settings=get_settings()
+    price=ticket_types(settings)[ticket_code]['price']
+    body=(f"💳 <b>{html.escape(method['name'])}</b>\n\nየሚከፍሉት፦ {format_price(price)} ብር\n"
+          f"የሂሳብ/ስልክ ቁጥር፦ <code>{html.escape(method['account'])}</code>\n"
+          f"የባለቤት ስም፦ {html.escape(method['holder'])}\n\n"
+          f"{html.escape(method['instruction'])}\n\n{html.escape(settings['receipt_instruction'])}")
+    await q.message.reply_text(body,parse_mode='HTML')
+
 def bank_details_configured(settings=None):
     settings = settings or get_settings()
     return all(
@@ -427,7 +520,8 @@ def bank_details_configured(settings=None):
 
 
 def update_setting(key, value):
-    if key not in ADMIN_SETTING_FIELDS:
+    allowed_feature_settings = {"public_sales_report", "tutorial_file_id", "tutorial_file_type", "tutorial_text"}
+    if key not in ADMIN_SETTING_FIELDS and key not in allowed_feature_settings:
         raise ValueError("Unknown setting.")
     with db_session() as db:
         db.execute(
@@ -442,7 +536,7 @@ def update_setting(key, value):
 def get_registered_user(user_id):
     with db_session() as db:
         return db.execute(
-            "SELECT user_id, display_name, phone_number, username FROM users WHERE user_id = ?",
+            "SELECT user_id, display_name, phone_number, username, address FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
 
@@ -461,7 +555,7 @@ def save_registered_user(user_id, display_name, phone_number, username):
             (user_id, display_name, phone_number, username),
         )
         return db.execute(
-            "SELECT user_id, display_name, phone_number, username FROM users WHERE user_id = ?",
+            "SELECT user_id, display_name, phone_number, username, address FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
 
@@ -880,16 +974,16 @@ def get_assignable_payment(payment_id, user_id):
         return payment
 
 
-def create_payment(user_id, ticket_type, receipt_file_id, ticket_code=None):
+def create_payment(user_id, ticket_type, receipt_file_id, ticket_code=None, payment_method_id=None):
     with db_session() as db:
         cursor = db.execute(
             """
             INSERT INTO payments
-                (user_id, ticket_type, ticket_code, receipt_file_id, status)
-            VALUES (?, ?, ?, ?, 'pending')
+                (user_id, ticket_type, ticket_code, receipt_file_id, payment_method_id, status)
+            VALUES (?, ?, ?, ?, ?, 'pending')
             RETURNING id
             """,
-            (user_id, ticket_type, ticket_code, receipt_file_id),
+            (user_id, ticket_type, ticket_code, receipt_file_id, payment_method_id),
         )
         return cursor.fetchone()["id"]
 
@@ -1092,9 +1186,11 @@ MY_TICKETS_BUTTON = "የኔ ትኬቶች"
 
 def main_menu_keyboard():
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(MY_TICKETS_BUTTON)]],
-        resize_keyboard=True,
-        is_persistent=True,
+        [[KeyboardButton("🎫 የኔ ትኬቶች"), KeyboardButton("🛒 ተጨማሪ ለመቁረጥ")],
+         [KeyboardButton("🔢 የዕጣ ቁጥሮች ሁኔታ"), KeyboardButton("📅 መቼ ይወጣል?")],
+         [KeyboardButton("👤 የግል መረጃ"), KeyboardButton("🆘 እገዛ / Support")],
+         [KeyboardButton("📚 Tutorial ለማየት")]],
+        resize_keyboard=True, is_persistent=True,
     )
 
 
@@ -1274,6 +1370,7 @@ async def show_lottery_menu(update, context, profile):
         parse_mode="HTML",
         reply_markup=ticket_selection_keyboard(settings),
     )
+    await update.message.reply_text("ዋና ማውጫ፦", reply_markup=main_menu_keyboard())
 
 
 async def ticket_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1323,19 +1420,10 @@ async def ticket_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     settings = get_settings()
-    if not bank_details_configured(settings):
-        await query.message.reply_text(
-            "የክፍያ መረጃው ገና አልተዘጋጀም። እባክዎ አድሚኑ እስኪያዘጋጅ ይጠብቁ።"
-        )
-        return
     context.user_data["ticket_code"] = ticket_code
     context.user_data["ticket_type"] = ticket_type_description(ticket_code, settings)
-    await query.message.reply_text(
-        f"ለእርስዎ <b>{html.escape(context.user_data['ticket_type'])}</b> መርጠዋል።\n\n"
-        + bank_info_text(settings, ticket_code),
-        parse_mode="HTML",
-        reply_markup=bank_info_keyboard(settings),
-    )
+    await query.message.reply_text(f"ለእርስዎ <b>{html.escape(context.user_data['ticket_type'])}</b> መርጠዋል።",parse_mode="HTML")
+    await prompt_payment_method(query.message, context, ticket_code)
 
 
 async def repeat_selection_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1377,19 +1465,10 @@ async def repeat_selection_handler(update: Update, context: ContextTypes.DEFAULT
         return
 
     settings = get_settings()
-    if not bank_details_configured(settings):
-        await query.message.reply_text(
-            "የክፍያ መረጃው ገና አልተዘጋጀም። እባክዎ አድሚኑ እስኪያዘጋጅ ይጠብቁ።"
-        )
-        return
     context.user_data["ticket_code"] = ticket_code
     context.user_data["ticket_type"] = ticket_type_description(ticket_code, settings)
-    await query.message.reply_text(
-        "✅ አዲስ ዕጣ ለመቀጠል ከታች ያለውን ክፍያ ይፈጽሙ።\n\n"
-        + bank_info_text(settings, ticket_code),
-        parse_mode="HTML",
-        reply_markup=bank_info_keyboard(settings),
-    )
+    await query.message.reply_text("✅ አዲስ ዕጣ ለመቀጠል የክፍያ አማራጭ ይምረጡ።")
+    await prompt_payment_method(query.message, context, ticket_code)
 
 
 async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1421,6 +1500,7 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ticket_type,
             update.message.photo[-1].file_id,
             ticket_code=ticket_code,
+            payment_method_id=context.user_data.get("payment_method_id"),
         )
     except psycopg2.IntegrityError:
         await update.message.reply_text(
@@ -1467,6 +1547,7 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.pop("ticket_type", None)
     context.user_data.pop("ticket_code", None)
+    context.user_data.pop("payment_method_id", None)
     await update.message.reply_text(
         "⏳ የክፍያ ደረሰኝዎ ለአድሚን ተልኳል። ከጸደቀ በኋላ የዕድል ቁጥር መምረጫው ይከፈትልዎታል።"
     )
@@ -1642,6 +1723,13 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         context.user_data.pop("admin_message_user_id", None)
         await update.message.reply_text("✅ መልእክቱ ተልኳል።")
+        return
+    if await v3_text_handler(update, context): return
+    if await profile_edit_handler(update, context): return
+    if await menu_text_handler(update, context): return
+    # Ignore unrelated text safely and return the customer to the service menu.
+    if update.message.text and get_registered_user(update.effective_user.id):
+        await update.message.reply_text(feature_menu_text(), reply_markup=main_menu_keyboard())
         return
     await manual_number_selection(update, context)
 
@@ -2269,6 +2357,232 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+# ------------------------- Sheger Lottery v3 features -------------------------
+def feature_menu_text():
+    return "እባኮትን የሚፈልጉትን አገልግሎት ይምረጡ።"
+
+def list_payment_methods():
+    with db_session() as db:
+        return db.execute("SELECT * FROM payment_methods WHERE active=TRUE ORDER BY id").fetchall()
+
+def audit(admin_id, action, details=""):
+    with db_session() as db:
+        db.execute("INSERT INTO admin_audit_log(admin_id,action,details) VALUES(?,?,?)", (admin_id, action, details[:2000]))
+
+async def show_user_tickets(update, context):
+    uid=update.effective_user.id
+    with db_session() as db:
+        rows=db.execute("""SELECT p.id,p.ticket_type,p.status,p.created_at,
+          STRING_AGG(DISTINCT ta.number, ', ') AS numbers
+          FROM payments p LEFT JOIN ticket_allocations ta ON ta.payment_id=p.id
+          WHERE p.user_id=? GROUP BY p.id ORDER BY p.id DESC LIMIT 30""",(uid,)).fetchall()
+    if not rows:
+        await update.message.reply_text("ገና የገዙት ትኬት የለም።",reply_markup=main_menu_keyboard()); return
+    lines=["🎫 <b>የእኔ የግዢ ታሪክ</b>"]
+    for r in rows:
+        lines.append(f"\n#{r['id']} | {html.escape(r['ticket_type'])}\nቁጥር፦ {html.escape(r['numbers'] or 'ገና አልተመደበም')}\nሁኔታ፦ {html.escape(r['status'])}\nቀን፦ {html.escape(str(r['created_at']))}")
+    await update.message.reply_text("\n".join(lines),parse_mode="HTML",reply_markup=main_menu_keyboard())
+
+async def show_public_number_report(update, context):
+    st=get_settings()
+    with db_session() as db:
+        agg=db.execute("""SELECT COUNT(DISTINCT number) AS sold_numbers, COUNT(*) AS sold_slots
+          FROM ticket_allocations""").fetchone()
+        paid=db.execute("""SELECT COALESCE(SUM(CASE WHEN ticket_code='half' THEN CAST(? AS NUMERIC) ELSE CAST(? AS NUMERIC) END),0) AS revenue
+          FROM payments WHERE status='assigned'""",(st['half_ticket_price'],st['full_ticket_price'])).fetchone()
+    first,last=int(st['first_number']),int(st['last_number'])
+    total=last-first+1
+    sold=int(agg['sold_numbers'] or 0)
+    # Admin-written report fields are shown separately; computed allocation counts are not hand-entered.
+    manual=(st.get('public_sales_report') or '').strip()
+    # User explicitly chose a manual report: figures and collection amounts are admin-entered.
+    msg=("🔢 <b>የዕጣ ቁጥሮች ሁኔታ / የሽያጭ ሪፖርት</b>\n\n" +
+         (html.escape(manual) if manual else "የሪፖርት መረጃው ገና በአድሚን አልተሞላም።"))
+    await update.message.reply_text(msg,parse_mode="HTML",reply_markup=main_menu_keyboard())
+
+async def menu_text_handler(update, context):
+    txt=(update.message.text or '').strip()
+    uid=update.effective_user.id
+    if txt in {"🎫 የኔ ትኬቶች", MY_TICKETS_BUTTON}:
+        await show_user_tickets(update,context); return True
+    if txt=="🔢 የዕጣ ቁጥሮች ሁኔታ":
+        await show_public_number_report(update,context); return True
+    if txt=="📅 መቼ ይወጣል?":
+        st=get_settings(); await update.message.reply_text(f"📅 <b>የዕጣ ማውጫ መረጃ</b>\n{html.escape(st.get('draw_datetime','Not announced'))}\n{html.escape(st.get('draw_status',''))}",parse_mode="HTML",reply_markup=main_menu_keyboard()); return True
+    if txt=="🆘 እገዛ / Support":
+        st=get_settings(); await update.message.reply_text(st.get('support_text') or "የSupport መረጃ ገና አልተዘጋጀም።",reply_markup=main_menu_keyboard()); return True
+    if txt=="📚 Tutorial ለማየት":
+        st=get_settings(); await update.message.reply_text(st.get('tutorial_text') or "Tutorial ገና አልተዘጋጀም።",reply_markup=main_menu_keyboard())
+        fid=st.get('tutorial_file_id'); typ=st.get('tutorial_file_type')
+        if fid:
+            if typ=='photo': await context.bot.send_photo(uid,fid)
+            elif typ=='video': await context.bot.send_video(uid,fid)
+        return True
+    if txt=="👤 የግል መረጃ":
+        context.user_data['profile_edit_step']='name'
+        await update.message.reply_text("አዲሱን ሙሉ ስምዎን ያስገቡ። ለመተው /cancel ይጻፉ።",reply_markup=main_menu_keyboard()); return True
+    if txt in {"🛒 ተጨማሪ ለመቁረጥ","አዲስ ትኬት ለመቁረጥ"}:
+        await update.message.reply_text("የዕጣ አይነት ይምረጡ፦",reply_markup=ticket_selection_keyboard(get_settings())); return True
+    return False
+
+async def admin_v3_command(update, context):
+    if update.effective_user.id!=context.bot_data['admin_id']:
+        await update.message.reply_text("የአድሚን ፈቃድ ያስፈልጋል።"); return
+    kb=InlineKeyboardMarkup([
+      [InlineKeyboardButton("➕ የክፍያ አማራጭ ጨምር",callback_data="v3:addmethod")],
+      [InlineKeyboardButton("📋 የክፍያ አማራጮች",callback_data="v3:methods")],
+      [InlineKeyboardButton("📣 Broadcast",callback_data="v3:broadcast")],
+      [InlineKeyboardButton("📊 የእጅ ሪፖርት መሙላት",callback_data="v3:report")],
+      [InlineKeyboardButton("🏆 የዕጣ ውጤት ማስገባት",callback_data="v3:winner")],
+      [InlineKeyboardButton("🆘 Support ጽሑፍ",callback_data="v3:content")],
+      [InlineKeyboardButton("📚 Tutorial ጽሑፍ",callback_data="v3:tutorialtext")],
+      [InlineKeyboardButton("⚙️ የጊዜ ገደብ እና ቀን",callback_data="v3:settings")],
+    ])
+    await update.message.reply_text("🛠 <b>የሸገር ሎተሪ ተጨማሪ አስተዳደር</b>",parse_mode="HTML",reply_markup=kb)
+
+async def v3_callback(update,context):
+    q=update.callback_query
+    if q.from_user.id!=context.bot_data['admin_id']:
+        await q.answer("አድሚን ብቻ።",show_alert=True); return
+    await q.answer()
+    if q.data=='v3:addmethod':
+        context.user_data['v3_state']='method_name'
+        await q.message.reply_text("የክፍያ አማራጩን ስም ይላኩ (ለምሳሌ Telebirr)።"); return
+    if q.data=='v3:methods':
+        methods=list_payment_methods()
+        if not methods: await q.message.reply_text("የተጨመረ የክፍያ አማራጭ የለም።"); return
+        for m in methods:
+            await q.message.reply_text(f"#{m['id']} {html.escape(m['name'])}\n{html.escape(m['account'])}\n{html.escape(m['holder'])}\n{html.escape(m['instruction'])}",parse_mode='HTML',reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("አቦዝን",callback_data=f"v3:disablemethod:{m['id']}")]]))
+        return
+    if q.data.startswith('v3:disablemethod:'):
+        mid=int(q.data.rsplit(':',1)[1])
+        with db_session() as db: db.execute("UPDATE payment_methods SET active=FALSE WHERE id=?",(mid,))
+        audit(q.from_user.id,'disable_payment_method',str(mid)); await q.message.reply_text("የክፍያ አማራጩ ተዘግቷል።"); return
+    if q.data=='v3:broadcast:confirm':
+        body=context.user_data.pop('v3_broadcast_body',None)
+        context.user_data.pop('v3_state',None)
+        if not body: await q.message.reply_text('የBroadcast ጽሑፍ አልተገኘም።'); return
+        with db_session() as db: users=db.execute("SELECT user_id FROM users ORDER BY user_id").fetchall()
+        sent=failed=0
+        for u in users:
+            try: await context.bot.send_message(chat_id=u['user_id'],text=body); sent+=1
+            except TelegramError: failed+=1
+            await asyncio.sleep(0.05)
+        with db_session() as db: db.execute("INSERT INTO broadcast_log(admin_id,body,sent_count,failed_count) VALUES(?,?,?,?)",(q.from_user.id,body,sent,failed))
+        audit(q.from_user.id,'broadcast',f'sent={sent},failed={failed}')
+        await q.message.reply_text(f'Broadcast ተጠናቋል። የተላከ፦ {sent} | ያልደረሰ፦ {failed}')
+        return
+    if q.data=='v3:broadcast:cancel':
+        context.user_data.pop('v3_broadcast_body',None); context.user_data.pop('v3_state',None)
+        await q.message.reply_text('Broadcast ተሰርዟል።'); return
+    states={'v3:tutorialtext':'tutorialtext','v3:broadcast':'broadcast','v3:report':'report','v3:winner':'winner','v3:content':'content','v3:settings':'settings'}
+    if q.data in states:
+        context.user_data['v3_state']=states[q.data]
+        prompts={'broadcast':'ለሁሉም ተጠቃሚዎች የሚላከውን ጽሑፍ ይላኩ።','report':'ለተጠቃሚዎች የሚታይ የሪፖርት ጽሑፍ ይላኩ።','winner':'የአሸናፊውን ቁጥር እና ማስታወቂያ በዚህ ቅርጽ ይላኩ፦ 1234 | የውጤት መልእክት','content':'Support ጽሑፍ ይላኩ።','tutorialtext':'Tutorial መመሪያ ጽሑፍ ይላኩ። ፎቶ/ቪዲዮ ለመጫን /tutorialupload ይጠቀሙ፣','settings':'Pending ጊዜ በሰዓት ይላኩ፤ በሚቀጥለው መልእክት የዕጣ ቀን ያስገቡ።'}
+        await q.message.reply_text(prompts[q.data]); return
+
+async def v3_text_handler(update,context):
+    state=context.user_data.get('v3_state'); txt=(update.message.text or '').strip()
+    if not state: return False
+    if update.effective_user.id!=context.bot_data['admin_id']:
+        context.user_data.pop('v3_state',None); return True
+    if state=='method_name':
+        context.user_data['v3_method_name']=txt; context.user_data['v3_state']='method_account'; prompt='የሂሳብ ቁጥር/ስልክ ይላኩ።'
+    elif state=='method_account':
+        context.user_data['v3_method_account']=txt; context.user_data['v3_state']='method_holder'; prompt='የሂሳብ ባለቤት ስም ይላኩ።'
+    elif state=='method_holder':
+        context.user_data['v3_method_holder']=txt; context.user_data['v3_state']='method_instruction'; prompt='የክፍያ Instruction ይላኩ።'
+    elif state=='method_instruction':
+        with db_session() as db: db.execute("INSERT INTO payment_methods(name,account,holder,instruction) VALUES(?,?,?,?)",(context.user_data.pop('v3_method_name'),context.user_data.pop('v3_method_account'),context.user_data.pop('v3_method_holder'),txt))
+        context.user_data.pop('v3_state',None); audit(update.effective_user.id,'add_payment_method',txt[:100]); await update.message.reply_text("የክፍያ አማራጩ ተጨምሯል።"); return True
+    elif state=='report':
+        update_setting('public_sales_report',txt); context.user_data.pop('v3_state',None); audit(update.effective_user.id,'update_manual_report'); await update.message.reply_text("ሪፖርቱ ተቀምጧል።"); return True
+    elif state=='broadcast':
+        if not txt or len(txt)>4096: await update.message.reply_text('ከ1 እስከ 4096 ቁምፊ ያለው መልእክት ይላኩ።'); return True
+        context.user_data['v3_broadcast_body']=txt
+        context.user_data['v3_state']='broadcast_confirm'
+        with db_session() as db: count=db.execute("SELECT COUNT(*) AS n FROM users").fetchone()['n']
+        await update.message.reply_text(f'⚠️ <b>Broadcast ማረጋገጫ</b>\n\nይህ መልእክት ለ{count} ተጠቃሚዎች ይላካል፦\n\n{html.escape(txt)}',parse_mode='HTML',reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('✅ አረጋግጥና ላክ',callback_data='v3:broadcast:confirm'),InlineKeyboardButton('❌ ሰርዝ',callback_data='v3:broadcast:cancel')]])); return True
+    elif state=='winner':
+        m=re.match(r'^\s*(\d+)\s*\|\s*(.+)$',txt)
+        if not m: await update.message.reply_text("ትክክለኛ ቅርጽ፦ 1234 | የውጤት መልእክት"); return True
+        number,announcement=m.groups(); st=get_settings()
+        if not int(st['first_number'])<=int(number)<=int(st['last_number']): await update.message.reply_text("ቁጥሩ ከተወሰነው ክልል ውጭ ነው።"); return True
+        with db_session() as db:
+            valid=db.execute("SELECT 1 FROM ticket_allocations WHERE number=? LIMIT 1",(number,)).fetchone()
+            if not valid: await update.message.reply_text("ይህ ቁጥር ተሽጦ አልተገኘም።"); return True
+            db.execute("INSERT INTO lottery_draw_results(winning_number,announcement,admin_id) VALUES(?,?,?)",(number,announcement,update.effective_user.id))
+            winners=db.execute("SELECT DISTINCT user_id FROM ticket_allocations WHERE number=?",(number,)).fetchall()
+        context.user_data.pop('v3_state',None); audit(update.effective_user.id,'announce_winner',number)
+        await update.message.reply_text("ውጤቱ ተመዝግቧል። ለአሸናፊዎች ማሳወቂያ እየተላከ ነው።")
+        for w in winners:
+            try: await context.bot.send_message(w['user_id'],f"🏆 እንኳን ደስ አለዎት! የአሸናፊ ቁጥር #{number}\n{announcement}")
+            except TelegramError: pass
+        await notify_admin(context,f"🏆 የዕጣ ውጤት፦ #{number}\n{html.escape(announcement)}")
+        return True
+    elif state=='content':
+        update_setting('support_text',txt); context.user_data.pop('v3_state',None); audit(update.effective_user.id,'update_support'); await update.message.reply_text("Support መረጃ ተቀምጧል።"); return True
+    elif state=='tutorialtext':
+        update_setting('tutorial_text',txt); context.user_data.pop('v3_state',None); audit(update.effective_user.id,'update_tutorial_text'); await update.message.reply_text("Tutorial ጽሑፍ ተቀምጧል።"); return True
+    elif state=='settings':
+        if not txt.isdigit() or not 1<=int(txt)<=720: await update.message.reply_text("ከ1 እስከ 720 ሰዓት ያስገቡ።"); return True
+        update_setting('pending_payment_hours',txt); context.user_data['v3_state']='drawdate'; await update.message.reply_text("አሁን የዕጣ ቀንና ሰዓት ያስገቡ።"); return True
+    elif state=='drawdate':
+        update_setting('draw_datetime',txt); context.user_data.pop('v3_state',None); audit(update.effective_user.id,'update_draw_date',txt); await update.message.reply_text("የPending ጊዜና የዕጣ ቀን ተቀምጠዋል።"); return True
+    return True
+
+async def tutorial_upload_command(update,context):
+    if update.effective_user.id!=context.bot_data['admin_id']:
+        await update.message.reply_text('አድሚን ብቻ ይህን ማድረግ ይችላል።'); return
+    context.user_data['await_tutorial_upload']=True
+    await update.message.reply_text('አሁን Tutorial ፎቶ ወይም ቪዲዮ ይላኩ።')
+
+async def tutorial_upload_handler(update,context):
+    if update.effective_user.id!=context.bot_data['admin_id'] or not context.user_data.get('await_tutorial_upload'): return
+    if update.message.video:
+        fid=update.message.video.file_id; typ='video'
+    elif update.message.photo:
+        fid=update.message.photo[-1].file_id; typ='photo'
+    else: return
+    update_setting('tutorial_file_id',fid); update_setting('tutorial_file_type',typ)
+    context.user_data.pop('await_tutorial_upload',None)
+    await update.message.reply_text('Tutorial ፋይሉ ተቀምጧል።')
+
+async def profile_edit_handler(update,context):
+    step=context.user_data.get('profile_edit_step')
+    if not step: return False
+    txt=(update.message.text or '').strip()
+    if step=='name':
+        if not 2<=len(txt)<=80: await update.message.reply_text('ስም ከ2 እስከ 80 ቁምፊ ይሁን።'); return True
+        context.user_data['profile_new_name']=txt; context.user_data['profile_edit_step']='phone'
+        await update.message.reply_text('አዲሱን ስልክ ቁጥር ያስገቡ።'); return True
+    if step=='phone':
+        phone=normalize_phone(txt)
+        if not phone: await update.message.reply_text('ትክክለኛ ስልክ ያስገቡ።'); return True
+        context.user_data['profile_new_phone']=phone; context.user_data['profile_edit_step']='address'
+        await update.message.reply_text('አድራሻዎን ያስገቡ፤ ካልፈለጉ /skip ይጻፉ።'); return True
+    if step=='address':
+        address='' if txt=='/skip' else txt
+        old=get_registered_user(update.effective_user.id)
+        newname=context.user_data.pop('profile_new_name'); newphone=context.user_data.pop('profile_new_phone')
+        with db_session() as db:
+            db.execute("UPDATE users SET display_name=?,phone_number=?,address=? WHERE user_id=?",(newname,newphone,address,update.effective_user.id))
+            db.execute("INSERT INTO user_profile_history(user_id,old_name,new_name,old_phone,new_phone,old_address,new_address) VALUES(?,?,?,?,?,?,?)",(update.effective_user.id,old['display_name'],newname,old['phone_number'],newphone,old['address'] or '',address))
+        context.user_data.pop('profile_edit_step',None)
+        await notify_admin(context,f"👤 የተጠቃሚ መረጃ ተቀይሯል\nID: <code>{update.effective_user.id}</code>\nስም: {html.escape(newname)}\nስልክ: {html.escape(newphone)}\nአድራሻ: {html.escape(address or 'አልተሰጠም')}",parse_mode='HTML')
+        await update.message.reply_text('መረጃዎ ተዘምኗል።',reply_markup=main_menu_keyboard()); return True
+    return False
+
+async def expire_pending_job(context):
+    # Expire only pending requests whose receipt was submitted; approved/assigned never expire.
+    hours=int(get_settings().get('pending_payment_hours') or 24)
+    with db_session() as db:
+        rows=db.execute("UPDATE payments SET status='failed' WHERE status='pending' AND created_at::timestamp < CURRENT_TIMESTAMP - (? * INTERVAL '1 hour') RETURNING id,user_id",(hours,)).fetchall()
+    for r in rows:
+        try: await context.bot.send_message(r['user_id'],"⌛ የክፍያ ጥያቄዎ የጊዜ ገደብ አልፎበታል። አዲስ ጥያቄ ለመጀመር የትኬት ግዢ ይምረጡ።")
+        except TelegramError: pass
+
 def main():
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     admin_id_value = (os.getenv("TELEGRAM_ADMIN_ID") or "").strip()
@@ -2294,6 +2608,8 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("admin", admin_settings_command))
+    application.add_handler(CommandHandler("adminv3", admin_v3_command))
+    application.add_handler(CommandHandler("tutorialupload", tutorial_upload_command))
     application.add_handler(
         CallbackQueryHandler(
             ticket_chosen,
@@ -2312,6 +2628,9 @@ def main():
     application.add_handler(
         CallbackQueryHandler(admin_management_callback, pattern=r"^manage:")
     )
+    application.add_handler(CallbackQueryHandler(v3_callback, pattern=r"^v3:"))
+    application.add_handler(CallbackQueryHandler(payment_method_callback, pattern=r"^paymethod:\d+$"))
+    application.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO), tutorial_upload_handler), group=1)
     application.add_handler(
         CallbackQueryHandler(number_mode_handler, pattern=r"^mode:(auto|manual):\d+$")
     )
@@ -2323,6 +2642,8 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler)
     )
 
+    if application.job_queue:
+        application.job_queue.run_repeating(expire_pending_job, interval=300, first=30, name="expire_pending_payments")
     application.run_polling()
 
 
