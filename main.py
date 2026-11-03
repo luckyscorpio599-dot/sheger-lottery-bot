@@ -11,6 +11,8 @@ from contextlib import contextmanager
 import html
 import logging
 import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import threading
 import re
 import secrets
 import psycopg2
@@ -2583,6 +2585,61 @@ async def expire_pending_job(context):
         try: await context.bot.send_message(r['user_id'],"⌛ የክፍያ ጥያቄዎ የጊዜ ገደብ አልፎበታል። አዲስ ጥያቄ ለመጀመር የትኬት ግዢ ይምረጡ።")
         except TelegramError: pass
 
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP endpoint for Render Web Service health checks."""
+
+    def do_GET(self):
+        if self.path not in ("/", "/health"):
+            self.send_error(404, "Not Found")
+            return
+        body = b"Sheger Lottery bot process is running\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_HEAD(self):
+        if self.path not in ("/", "/health"):
+            self.send_error(404, "Not Found")
+            return
+        body = b"Sheger Lottery bot process is running\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        # Keep routine health-check requests out of the Render application logs.
+        return
+
+
+def start_health_server():
+    """Bind the HTTP health endpoint to Render's assigned port."""
+    port_value = (os.getenv("PORT") or "").strip()
+    if not port_value:
+        raise RuntimeError(
+            "Render did not provide PORT. This deployment must run as a Web Service."
+        )
+    try:
+        port = int(port_value)
+    except ValueError as exc:
+        raise RuntimeError("PORT must be a valid integer.") from exc
+    if not 1 <= port <= 65535:
+        raise RuntimeError("PORT must be between 1 and 65535.")
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="render-health-check",
+        daemon=True,
+    )
+    thread.start()
+    logging.info("Render health-check server listening on 0.0.0.0:%s", port)
+    return server
+
 def main():
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     admin_id_value = (os.getenv("TELEGRAM_ADMIN_ID") or "").strip()
@@ -2644,7 +2701,15 @@ def main():
 
     if application.job_queue:
         application.job_queue.run_repeating(expire_pending_job, interval=300, first=30, name="expire_pending_payments")
-    application.run_polling()
+
+    # Render Web Services require an HTTP listener on 0.0.0.0:$PORT.
+    # The bot itself continues to receive Telegram updates through polling.
+    health_server = start_health_server()
+    try:
+        application.run_polling()
+    finally:
+        health_server.shutdown()
+        health_server.server_close()
 
 
 if __name__ == "__main__":
