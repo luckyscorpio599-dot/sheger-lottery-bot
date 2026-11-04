@@ -535,7 +535,7 @@ async def payment_method_callback(update, context):
         body,
         parse_mode='HTML',
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-            "📋 የሂሳብ ቁጥሩን Copy ለማድረግ", copy_text=CopyTextButton(text=method['account'])
+            "📋 የሂሳብ ቁጥሩን ቅዳ", copy_text=CopyTextButton(text=method['account'])
         )]]),
     )
 
@@ -800,9 +800,19 @@ def bank_info_keyboard(settings):
         [
             [
                 InlineKeyboardButton(
-                    "📋 የሂሳብ ቁጥሩን Copy ለማድረግ",
+                    "📋 የሂሳብ ቁጥሩን ቅዳ",
                     copy_text=CopyTextButton(text=settings["bank_account"]),
                 )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📋 የባንክ ስም ቅዳ",
+                    copy_text=CopyTextButton(text=settings["bank_name"]),
+                ),
+                InlineKeyboardButton(
+                    "📋 የባለቤት ስም ቅዳ",
+                    copy_text=CopyTextButton(text=settings["account_holder"]),
+                ),
             ],
         ]
     )
@@ -2566,7 +2576,7 @@ async def show_numbers_and_auto_delete(query, context, page=0, range_index=0):
     settings = get_settings()
     configured_first = int(settings["first_number"])
     configured_last = int(settings["last_number"])
-    ranges = [[(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000)]
+    ranges = [(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000)]
     range_index = max(0, min(int(range_index), 5))
     range_first, range_last = ranges[range_index]
     first_number = max(configured_first, range_first)
