@@ -27,7 +27,7 @@ from telegram import (
     ReplyKeyboardRemove,
     Update,
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -48,7 +48,6 @@ DEFAULT_SETTINGS = {
         "3️⃣ አድሚን ካጸደቀው በኋላ የዕድል ቁጥር ይምረጡ።"
     ),
     "welcome_prompt": "ለመጀመር ከታች የዕጣ አይነት ይምረጡ፦",
-    "welcome_photo_file_id": "",
     "payment_intro": (
         "እባክዎ የመረጡትን የዕጣ መጠን ክፍያ በሚከተለው የባንክ ሂሳብ ያስገቡ፦"
     ),
@@ -317,8 +316,6 @@ def init_db():
         ).fetchall()}
         if "address" not in user_columns:
             db.execute("ALTER TABLE users ADD COLUMN address TEXT")
-        if "is_deleted" not in user_columns:
-            db.execute("ALTER TABLE users ADD COLUMN is_deleted BOOLEAN NOT NULL DEFAULT FALSE")
         db.executescript("""
             CREATE TABLE IF NOT EXISTS payment_methods (
                 id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, account TEXT NOT NULL DEFAULT '',
@@ -514,7 +511,13 @@ async def payment_method_callback(update, context):
           f"የሂሳብ/ስልክ ቁጥር፦ <code>{html.escape(method['account'])}</code>\n"
           f"የባለቤት ስም፦ {html.escape(method['holder'])}\n\n"
           f"{html.escape(method['instruction'])}\n\n{html.escape(settings['receipt_instruction'])}")
-    await q.message.reply_text(body,parse_mode='HTML')
+    await q.message.reply_text(
+        body,
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            "📋 የሂሳብ ቁጥሩን ቅዳ", copy_text=CopyTextButton(text=method['account'])
+        )]]),
+    )
 
 def bank_details_configured(settings=None):
     settings = settings or get_settings()
@@ -525,7 +528,7 @@ def bank_details_configured(settings=None):
 
 
 def update_setting(key, value):
-    allowed_feature_settings = {"public_sales_report", "tutorial_file_id", "tutorial_file_type", "tutorial_text", "welcome_photo_file_id"}
+    allowed_feature_settings = {"public_sales_report", "tutorial_file_id", "tutorial_file_type", "tutorial_text"}
     if key not in ADMIN_SETTING_FIELDS and key not in allowed_feature_settings:
         raise ValueError("Unknown setting.")
     with db_session() as db:
@@ -541,7 +544,7 @@ def update_setting(key, value):
 def get_registered_user(user_id):
     with db_session() as db:
         return db.execute(
-            "SELECT user_id, display_name, phone_number, username, address FROM users WHERE user_id = ? AND is_deleted = FALSE",
+            "SELECT user_id, display_name, phone_number, username, address FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
 
@@ -555,8 +558,7 @@ def save_registered_user(user_id, display_name, phone_number, username):
             ON CONFLICT(user_id) DO UPDATE SET
                 display_name = excluded.display_name,
                 phone_number = excluded.phone_number,
-                username = excluded.username,
-                is_deleted = FALSE
+                username = excluded.username
             """,
             (user_id, display_name, phone_number, username),
         )
@@ -572,7 +574,6 @@ def get_registered_users_page(offset, limit=10):
             """
             SELECT user_id, display_name, phone_number, username
             FROM users
-            WHERE is_deleted = FALSE
             ORDER BY registered_at DESC, user_id DESC
             LIMIT ? OFFSET ?
             """,
@@ -582,7 +583,7 @@ def get_registered_users_page(offset, limit=10):
 
 def count_registered_users():
     with db_session() as db:
-        return db.execute("SELECT COUNT(*) FROM users WHERE is_deleted = FALSE").fetchone()[0]
+        return db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
 
 def get_number_states(first_number, last_number):
@@ -603,11 +604,13 @@ def get_number_states(first_number, last_number):
             """,
             (first_number, last_number),
         ).fetchall()
-    occupied = {row["number"]: row["occupied"] for row in occupied_rows}
-    blocked = {row["number"] for row in blocked_rows}
+    # Existing allocations remain stored as four-digit strings for backward compatibility.
+    occupied = {str(int(row["number"])): row["occupied"] for row in occupied_rows}
+    blocked = {str(int(row["number"])) for row in blocked_rows}
     states = {}
     for number in range(first_number, last_number + 1):
-        key = f"{number:04d}"
+        key = str(number)
+        stored_key = f"{number:04d}"
         used = occupied.get(key, 0)
         if key in blocked or used >= 2:
             states[key] = "taken"
@@ -619,6 +622,7 @@ def get_number_states(first_number, last_number):
 
 
 def get_number_allocations(number):
+    number = canonical_number(number)
     with db_session() as db:
         return db.execute(
             """
@@ -638,7 +642,15 @@ def get_number_allocations(number):
         ).fetchall()
 
 
+def canonical_number(number):
+    value = str(number).strip()
+    if not value.isascii() or not value.isdigit():
+        raise ValueError("ትክክለኛ ቁጥር ያስገቡ።")
+    return f"{int(value):04d}"
+
+
 def is_number_blocked(number):
+    number = canonical_number(number)
     with db_session() as db:
         return db.execute(
             "SELECT 1 FROM blocked_numbers WHERE number = ?", (number,)
@@ -646,6 +658,7 @@ def is_number_blocked(number):
 
 
 def reserve_number(number, admin_id):
+    number = canonical_number(number)
     settings = get_settings()
     if not (int(settings["first_number"]) <= int(number) <= int(settings["last_number"])):
         raise ValueError("ቁጥሩ በአሁኑ የዕጣ ክልል ውስጥ አይደለም።")
@@ -673,6 +686,7 @@ def reserve_number(number, admin_id):
 
 
 def release_admin_block(number):
+    number = canonical_number(number)
     with db_session() as db:
         cursor = db.execute("DELETE FROM blocked_numbers WHERE number = ?", (number,))
         return cursor.rowcount > 0
@@ -761,9 +775,26 @@ def bank_info_text(settings, ticket_code):
 
 
 def bank_info_keyboard(settings):
-    # Payment details are display-only. The only copy action in the user flow
-    # is the assigned lottery number.
-    return None
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📋 የሂሳብ ቁጥሩን ቅዳ",
+                    copy_text=CopyTextButton(text=settings["bank_account"]),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📋 የባንክ ስም ቅዳ",
+                    copy_text=CopyTextButton(text=settings["bank_name"]),
+                ),
+                InlineKeyboardButton(
+                    "📋 የባለቤት ስም ቅዳ",
+                    copy_text=CopyTextButton(text=settings["account_holder"]),
+                ),
+            ],
+        ]
+    )
 
 
 def admin_settings_keyboard():
@@ -794,8 +825,8 @@ def admin_settings_summary():
         f"👤 ባለቤት፦ {html.escape(settings['account_holder'])}\n"
         f"🎫 {html.escape(full['label'])}፦ {format_price(full['price'])} ብር\n"
         f"🎟️ {html.escape(half['label'])}፦ {format_price(half['price'])} ብር\n"
-        f"🔢 ቁጥሮች፦ {int(settings['first_number']):04d}–"
-        f"{int(settings['last_number']):04d}\n\n"
+        f"🔢 ቁጥሮች፦ {int(settings['first_number'])}–"
+        f"{int(settings['last_number'])}\n\n"
         "ለመቀየር ከታች አንዱን ይምረጡ።"
     )
 
@@ -1028,14 +1059,15 @@ def assign_ticket(payment_id, user_id, requested_number=None):
     last_number = int(settings["last_number"])
     if requested_number is not None:
         if (
-            not requested_number.isascii()
-            or not requested_number.isdigit()
-            or len(requested_number) != 4
+            not str(requested_number).isascii()
+            or not str(requested_number).isdigit()
+            or not 1 <= len(str(requested_number)) <= 4
             or not (first_number <= int(requested_number) <= last_number)
         ):
             raise ValueError(
-                f"Choose a four-digit number from {first_number:04d} to {last_number:04d}."
+                f"Choose a number from {first_number} to {last_number}."
             )
+        requested_number = f"{int(requested_number):04d}"
 
     db = connect_db()
     try:
@@ -1255,19 +1287,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     profile = get_registered_user(user.id)
     if profile is None:
-        # Always begin a fresh registration sequence for an unregistered user.
         context.user_data.pop("registration_name", None)
-        context.user_data.pop("registration_step", None)
         context.user_data["registration_step"] = "name"
-        settings = get_settings()
-        welcome = (settings.get("welcome_prompt") or "እንኳን ወደ ሸገር ሎተሪ በደህና መጡ።").strip()
-        instructions = (settings.get("welcome_instructions") or "").strip()
-        photo_id = (settings.get("welcome_photo_file_id") or "").strip()
-        if photo_id:
-            await update.message.reply_photo(photo=photo_id)
-        welcome_text = welcome + ("\n\n" + instructions if instructions else "")
-        await update.message.reply_text(welcome_text)
-        await update.message.reply_text("ለመጀመር እባክዎ ሙሉ ስምዎን ያስገቡ።")
+        await update.message.reply_text("ሎተሪውን ለመቀጠል እባክዎ ሙሉ ስምዎን ያስገቡ።")
         return
     await show_lottery_menu(update, context, profile)
 
@@ -1289,7 +1311,7 @@ async def complete_registration(update, context, phone_number):
         parse_mode="HTML",
     )
     await update.message.reply_text(
-        "🎉 እንኳን ደስ አሎት ምዝገባዎትን በስትክክል ጨርሰዋል ።",
+        "✅ ምዝገባዎ ተጠናቋል።",
         reply_markup=ReplyKeyboardRemove(),
     )
     await show_lottery_menu(update, context, profile)
@@ -1726,12 +1748,15 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     if await v3_text_handler(update, context): return
     if await profile_edit_handler(update, context): return
+    # An approved payment's manual number entry must be handled before menu fallback.
+    if context.user_data.get("manual_payment_id") is not None:
+        await manual_number_selection(update, context)
+        return
     if await menu_text_handler(update, context): return
     # Ignore unrelated text safely and return the customer to the service menu.
     if update.message.text and get_registered_user(update.effective_user.id):
         await update.message.reply_text(feature_menu_text(), reply_markup=main_menu_keyboard())
         return
-    await manual_number_selection(update, context)
 
 
 async def edit_admin_view(query, text, reply_markup=None):
@@ -1795,7 +1820,7 @@ async def show_admin_number_page(query, page):
         for number, state in states.items()
     ]
     text = (
-        f"📊 <b>የቁጥሮች ሁኔታ ({start:04d}–{end:04d})</b>\n"
+        f"📊 <b>የቁጥሮች ሁኔታ ({start}–{end})</b>\n"
         f"ገጽ {page + 1}/{page_count}\n"
         "🟢 ክፍት · 🟡 ግማሽ አለ · 🔴 ተይዟል\n\n"
         + "\n".join(lines)
@@ -1864,9 +1889,9 @@ async def show_admin_number_detail(query, number, page):
     allocations = get_number_allocations(number)
     blocked = is_number_blocked(number)
     settings = get_settings()
-    state = get_number_states(int(number), int(number))[number]
+    state = get_number_states(int(number), int(number))[str(int(number))]
     lines = [
-        f"🔢 <b>ቁጥር {number}</b> — {number_status_text(state)}",
+        f"🔢 <b>ቁጥር {int(number)}</b> — {number_status_text(state)}",
         "",
     ]
     if blocked:
@@ -1969,12 +1994,12 @@ async def admin_management_callback(update: Update, context: ContextTypes.DEFAUL
         await show_admin_number_page(query, int(match.group(1)))
         return
 
-    match = re.fullmatch(r"manage:number:(\d{4}):(\d+)", data)
+    match = re.fullmatch(r"manage:number:(\d{1,4}):(\d+)", data)
     if match:
         await show_admin_number_detail(query, match.group(1), int(match.group(2)))
         return
 
-    match = re.fullmatch(r"manage:reserve:(\d{4}):(\d+)", data)
+    match = re.fullmatch(r"manage:reserve:(\d{1,4}):(\d+)", data)
     if match:
         number, page = match.groups()
         await edit_admin_view(
@@ -1995,7 +2020,7 @@ async def admin_management_callback(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
-    match = re.fullmatch(r"manage:confirm_reserve:(\d{4}):(\d+)", data)
+    match = re.fullmatch(r"manage:confirm_reserve:(\d{1,4}):(\d+)", data)
     if match:
         number, page = match.groups()
         try:
@@ -2007,7 +2032,7 @@ async def admin_management_callback(update: Update, context: ContextTypes.DEFAUL
         await show_admin_number_page(query, int(page))
         return
 
-    match = re.fullmatch(r"manage:unblock:(\d{4}):(\d+)", data)
+    match = re.fullmatch(r"manage:unblock:(\d{1,4}):(\d+)", data)
     if match:
         number, page = match.groups()
         await edit_admin_view(
@@ -2028,7 +2053,7 @@ async def admin_management_callback(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
-    match = re.fullmatch(r"manage:confirm_unblock:(\d{4}):(\d+)", data)
+    match = re.fullmatch(r"manage:confirm_unblock:(\d{1,4}):(\d+)", data)
     if match:
         number, page = match.groups()
         released = release_admin_block(number)
@@ -2092,7 +2117,7 @@ async def admin_management_callback(update: Update, context: ContextTypes.DEFAUL
             await context.bot.send_message(
                 chat_id=user_id,
                 text=(
-                    f"ℹ️ አድሚኑ ቁጥር #{number}ን ከምደባዎ አስወግዷል። "
+                    f"ℹ️ አድሚኑ ቁጥር #{int(number)}ን ከምደባዎ አስወግዷል። "
                     "ክፍያዎ አልተሰረዘም፤ ከታች አዲስ ቁጥር ይምረጡ፦"
                 ),
                 reply_markup=number_mode_keyboard(payment_id),
@@ -2168,9 +2193,9 @@ async def number_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["manual_payment_id"] = payment_id
         settings = get_settings()
         await query.message.reply_text(
-            f"✏️ ከ <b>{int(settings['first_number']):04d} እስከ "
-            f"{int(settings['last_number']):04d}</b> ያለ ባለ 4 አሃዝ ቁጥር ይጻፉ።\n"
-            "ምሳሌ፦ 0452",
+            f"✏️ ከ <b>{int(settings['first_number'])} እስከ "
+            f"{int(settings['last_number'])}</b> ያለ ቁጥር ይጻፉ።\n"
+            "ምሳሌ፦ 7 ወይም 100 ወይም 452",
             parse_mode="HTML",
         )
         return
@@ -2221,8 +2246,8 @@ async def finish_ticket_selection(
     except ValueError:
         settings = get_settings()
         await send_reply(
-            f"ከ {int(settings['first_number']):04d} እስከ "
-            f"{int(settings['last_number']):04d} ያለ ትክክለኛ ባለ 4 አሃዝ ቁጥር ይጻፉ።"
+            f"ከ {int(settings['first_number'])} እስከ "
+            f"{int(settings['last_number'])} ያለ ትክክለኛ ቁጥር ይጻፉ።"
         )
         return
 
@@ -2231,7 +2256,6 @@ async def finish_ticket_selection(
         f"🎉 እንኳን ደስ አለዎት!\n\n🎫 {prefix} የዕድል ቁጥርዎ፦ <b>#{number}</b>\n\n"
         "ቁጥርዎ በውድድሩ ላይ ተመዝግቧል።",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 የዕጣ ቁጥሩን ቅዳ", copy_text=CopyTextButton(text=str(number)))]]),
     )
     if not already_assigned:
         profile = get_registered_user(user_id)
@@ -2309,7 +2333,7 @@ async def show_numbers_and_auto_delete(query, context, page=0):
         for number, state in states.items()
     ]
     text = (
-        f"📋 <b>የቁጥሮች ሁኔታ ({page_start:04d}–{page_end:04d})</b>\n"
+        f"📋 <b>የቁጥሮች ሁኔታ ({page_start}–{page_end})</b>\n"
         f"🟢 ክፍት  ·  🟡 ግማሽ አለ  ·  🔴 ተይዟል\n\n"
         + "\n".join(lines)
     )
@@ -2433,12 +2457,12 @@ async def admin_v3_command(update, context):
     kb=InlineKeyboardMarkup([
       [InlineKeyboardButton("➕ የክፍያ አማራጭ ጨምር",callback_data="v3:addmethod")],
       [InlineKeyboardButton("📋 የክፍያ አማራጮች",callback_data="v3:methods")],
-      [InlineKeyboardButton("👥 ተጠቃሚዎች / ተጠቃሚ ሰርዝ",callback_data="v3:users:0")],
       [InlineKeyboardButton("📣 Broadcast",callback_data="v3:broadcast")],
       [InlineKeyboardButton("📊 የእጅ ሪፖርት መሙላት",callback_data="v3:report")],
       [InlineKeyboardButton("🏆 የዕጣ ውጤት ማስገባት",callback_data="v3:winner")],
       [InlineKeyboardButton("🆘 Support ጽሑፍ",callback_data="v3:content")],
-      [InlineKeyboardButton("📚 Tutorial ጽሑፍ",callback_data="v3:tutorialtext")],
+      [InlineKeyboardButton("📚 Tutorial ጽሑፍ አስተካክል",callback_data="v3:tutorialtext")],
+      [InlineKeyboardButton("📎 Tutorial ፎቶ/ቪዲዮ ጫን",callback_data="v3:tutorialupload")],
       [InlineKeyboardButton("⚙️ የጊዜ ገደብ እና ቀን",callback_data="v3:settings")],
     ])
     await update.message.reply_text("🛠 <b>የሸገር ሎተሪ ተጨማሪ አስተዳደር</b>",parse_mode="HTML",reply_markup=kb)
@@ -2448,64 +2472,18 @@ async def v3_callback(update,context):
     if q.from_user.id!=context.bot_data['admin_id']:
         await q.answer("አድሚን ብቻ።",show_alert=True); return
     await q.answer()
-    if q.data.startswith('v3:users:'):
-        page = max(0, int(q.data.rsplit(':', 1)[1]))
-        users = get_registered_users_page(page * 10, 10)
-        total = count_registered_users()
-        if not users:
-            await q.message.reply_text("ምንም የተመዘገበ ተጠቃሚ የለም።")
-            return
-        for u in users:
-            label = f"🗑 ሰርዝ: {u['display_name'][:24]}"
-            await q.message.reply_text(
-                f"👤 {html.escape(u['display_name'])}\n📞 {html.escape(u['phone_number'])}\n🆔 <code>{u['user_id']}</code>",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"v3:deleteuser:{u['user_id']}")]])
-            )
-        nav=[]
-        if page > 0: nav.append(InlineKeyboardButton("⬅️ ቀዳሚ", callback_data=f"v3:users:{page-1}"))
-        if (page+1)*10 < total: nav.append(InlineKeyboardButton("ቀጣይ ➡️", callback_data=f"v3:users:{page+1}"))
-        if nav: await q.message.reply_text(f"ገጽ {page+1} / {(total+9)//10}", reply_markup=InlineKeyboardMarkup([nav]))
-        return
-    if q.data.startswith('v3:deleteuser:'):
-        target = int(q.data.rsplit(':', 1)[1])
-        if target == context.bot_data['admin_id']:
-            await q.message.reply_text("የአድሚን መለያ መሰረዝ አይቻልም።")
-            return
-        user = get_registered_user(target)
-        if not user:
-            await q.message.reply_text("ተጠቃሚው አልተገኘም።")
-            return
-        context.user_data['pending_user_delete'] = target
-        await q.message.reply_text(
-            f"⚠️ {html.escape(user['display_name'])} (ID {target}) ከተጠቃሚ ዝርዝር እንዲወገድ ያረጋግጡ።\nየክፍያና የትኬት ታሪክ ለሂሳብ መዝገብ ይቀመጣል፤ የግል መረጃው ግን ይደበቃል።",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ አረጋግጥ", callback_data=f"v3:confirmdelete:{target}"), InlineKeyboardButton("❌ ተው", callback_data="v3:canceldelete")]])
-        )
-        return
-    if q.data.startswith('v3:confirmdelete:'):
-        target = int(q.data.rsplit(':', 1)[1])
-        if context.user_data.get('pending_user_delete') != target or target == context.bot_data['admin_id']:
-            await q.message.reply_text("የማረጋገጫ ጥያቄው አልተገኘም። እንደገና ይሞክሩ።")
-            return
-        with db_session() as db:
-            db.execute("UPDATE users SET is_deleted=TRUE, display_name='[DELETED USER]', phone_number='', username=NULL, address=NULL WHERE user_id=?", (target,))
-        context.user_data.pop('pending_user_delete', None)
-        audit(q.from_user.id, 'soft_delete_user', str(target))
-        await q.message.reply_text("✅ ተጠቃሚው ከንቁ ዝርዝር ተወግዷል። የክፍያ/ትኬት የሂሳብ መዝገቡ ተጠብቋል።")
-        return
-    if q.data == 'v3:canceldelete':
-        context.user_data.pop('pending_user_delete', None)
-        await q.message.reply_text("የተጠቃሚ ስረዛ ተሰርዟል።")
-        return
     if q.data=='v3:addmethod':
         context.user_data['v3_state']='method_name'
-        await q.message.reply_text("የክፍያ አማራጩን ስም ይላኩ (ለምሳሌ Telebirr)።"); return
+        context.user_data.pop('v3_method_name',None); context.user_data.pop('v3_method_account',None); context.user_data.pop('v3_method_holder',None)
+        await q.message.reply_text("የክፍያ አማራጩን ስም ይላኩ (ለምሳሌ CBE, Awash, Dashen, Telebirr)።"); return
+    if q.data=='v3:tutorialupload':
+        context.user_data['await_tutorial_upload']=True
+        await q.message.reply_text("አሁን Tutorial ፎቶ ወይም ቪዲዮ ይላኩ። ከዚያ በኋላ በተጠቃሚዎች Tutorial ገጽ ላይ ይታያል።"); return
     if q.data=='v3:methods':
         methods=list_payment_methods()
         if not methods: await q.message.reply_text("የተጨመረ የክፍያ አማራጭ የለም።"); return
         for m in methods:
-            await q.message.reply_text(f"#{m['id']} {html.escape(m['name'])}\n{html.escape(m['account'])}\n{html.escape(m['holder'])}\n{html.escape(m['instruction'])}",parse_mode='HTML',reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("አቦዝን",callback_data=f"v3:disablemethod:{m['id']}")]]))
+            await q.message.reply_text(f"#{m['id']} <b>{html.escape(m['name'])}</b>\nየሂሳብ ቁጥር፦ <code>{html.escape(m['account'])}</code>\nየባለቤት ስም፦ {html.escape(m['holder'])}\nመመሪያ፦ {html.escape(m['instruction'])}",parse_mode='HTML',reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("አቦዝን",callback_data=f"v3:disablemethod:{m['id']}")]]))
         return
     if q.data.startswith('v3:disablemethod:'):
         mid=int(q.data.rsplit(':',1)[1])
@@ -2515,12 +2493,24 @@ async def v3_callback(update,context):
         body=context.user_data.pop('v3_broadcast_body',None)
         context.user_data.pop('v3_state',None)
         if not body: await q.message.reply_text('የBroadcast ጽሑፍ አልተገኘም።'); return
-        with db_session() as db: users=db.execute("SELECT user_id FROM users WHERE is_deleted = FALSE ORDER BY user_id").fetchall()
+        with db_session() as db: users=db.execute("SELECT user_id FROM users ORDER BY user_id").fetchall()
         sent=failed=0
         for u in users:
-            try: await context.bot.send_message(chat_id=u['user_id'],text=body); sent+=1
-            except TelegramError: failed+=1
-            await asyncio.sleep(0.05)
+            try:
+                await context.bot.send_message(chat_id=u['user_id'], text=body)
+                sent += 1
+            except RetryAfter as exc:
+                delay = getattr(exc, 'retry_after', 1)
+                delay = delay.total_seconds() if hasattr(delay, 'total_seconds') else float(delay)
+                await asyncio.sleep(delay + 1)
+                try:
+                    await context.bot.send_message(chat_id=u['user_id'], text=body)
+                    sent += 1
+                except TelegramError:
+                    failed += 1
+            except TelegramError:
+                failed += 1
+            await asyncio.sleep(0.10)
         with db_session() as db: db.execute("INSERT INTO broadcast_log(admin_id,body,sent_count,failed_count) VALUES(?,?,?,?)",(q.from_user.id,body,sent,failed))
         audit(q.from_user.id,'broadcast',f'sent={sent},failed={failed}')
         await q.message.reply_text(f'Broadcast ተጠናቋል። የተላከ፦ {sent} | ያልደረሰ፦ {failed}')
@@ -2540,27 +2530,32 @@ async def v3_text_handler(update,context):
     if update.effective_user.id!=context.bot_data['admin_id']:
         context.user_data.pop('v3_state',None); return True
     if state=='method_name':
+        if not txt or len(txt) > 80: await update.message.reply_text('የክፍያ አማራጩን ስም በትክክል ያስገቡ።'); return True
         context.user_data['v3_method_name']=txt; context.user_data['v3_state']='method_account'; prompt='የሂሳብ ቁጥር/ስልክ ይላኩ።'
     elif state=='method_account':
+        if not txt or len(txt) > 100: await update.message.reply_text('ትክክለኛ የሂሳብ ቁጥር/ስልክ ያስገቡ።'); return True
         context.user_data['v3_method_account']=txt; context.user_data['v3_state']='method_holder'; prompt='የሂሳብ ባለቤት ስም ይላኩ።'
     elif state=='method_holder':
-        context.user_data['v3_method_holder']=txt; context.user_data['v3_state']='method_instruction'; prompt='የክፍያ Instruction ይላኩ።'
+        if not txt or len(txt) > 100: await update.message.reply_text('የሂሳብ ባለቤት ስም ያስገቡ።'); return True
+        context.user_data['v3_method_holder']=txt; context.user_data['v3_state']='method_instruction'; prompt='ለተጠቃሚው የሚታይ የክፍያ መመሪያ ይላኩ፤ ከሌለ ምንም ይላኩ።'
     elif state=='method_instruction':
-        with db_session() as db: db.execute("INSERT INTO payment_methods(name,account,holder,instruction) VALUES(?,?,?,?)",(context.user_data.pop('v3_method_name'),context.user_data.pop('v3_method_account'),context.user_data.pop('v3_method_holder'),txt))
-        context.user_data.pop('v3_state',None); audit(update.effective_user.id,'add_payment_method',txt[:100]); await update.message.reply_text("የክፍያ አማራጩ ተጨምሯል።"); return True
+        with db_session() as db:
+            db.execute("INSERT INTO payment_methods(name,account,holder,instruction) VALUES(?,?,?,?)",(context.user_data.pop('v3_method_name'),context.user_data.pop('v3_method_account'),context.user_data.pop('v3_method_holder'),txt))
+        context.user_data.pop('v3_state',None); audit(update.effective_user.id,'add_payment_method',txt[:100]); await update.message.reply_text("✅ አዲሱ የክፍያ አማራጭ ተቀምጧል። ሌላ ባንክ ለመጨመር /adminv3 ይጻፉ።"); return True
     elif state=='report':
         update_setting('public_sales_report',txt); context.user_data.pop('v3_state',None); audit(update.effective_user.id,'update_manual_report'); await update.message.reply_text("ሪፖርቱ ተቀምጧል።"); return True
     elif state=='broadcast':
         if not txt or len(txt)>4096: await update.message.reply_text('ከ1 እስከ 4096 ቁምፊ ያለው መልእክት ይላኩ።'); return True
         context.user_data['v3_broadcast_body']=txt
         context.user_data['v3_state']='broadcast_confirm'
-        with db_session() as db: count=db.execute("SELECT COUNT(*) AS n FROM users WHERE is_deleted = FALSE").fetchone()['n']
+        with db_session() as db: count=db.execute("SELECT COUNT(*) AS n FROM users").fetchone()['n']
         await update.message.reply_text(f'⚠️ <b>Broadcast ማረጋገጫ</b>\n\nይህ መልእክት ለ{count} ተጠቃሚዎች ይላካል፦\n\n{html.escape(txt)}',parse_mode='HTML',reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('✅ አረጋግጥና ላክ',callback_data='v3:broadcast:confirm'),InlineKeyboardButton('❌ ሰርዝ',callback_data='v3:broadcast:cancel')]])); return True
     elif state=='winner':
         m=re.match(r'^\s*(\d+)\s*\|\s*(.+)$',txt)
         if not m: await update.message.reply_text("ትክክለኛ ቅርጽ፦ 1234 | የውጤት መልእክት"); return True
         number,announcement=m.groups(); st=get_settings()
         if not int(st['first_number'])<=int(number)<=int(st['last_number']): await update.message.reply_text("ቁጥሩ ከተወሰነው ክልል ውጭ ነው።"); return True
+        number = canonical_number(number)
         with db_session() as db:
             valid=db.execute("SELECT 1 FROM ticket_allocations WHERE number=? LIMIT 1",(number,)).fetchone()
             if not valid: await update.message.reply_text("ይህ ቁጥር ተሽጦ አልተገኘም።"); return True
@@ -2569,9 +2564,9 @@ async def v3_text_handler(update,context):
         context.user_data.pop('v3_state',None); audit(update.effective_user.id,'announce_winner',number)
         await update.message.reply_text("ውጤቱ ተመዝግቧል። ለአሸናፊዎች ማሳወቂያ እየተላከ ነው።")
         for w in winners:
-            try: await context.bot.send_message(w['user_id'],f"🏆 እንኳን ደስ አለዎት! የአሸናፊ ቁጥር #{number}\n{announcement}")
+            try: await context.bot.send_message(w['user_id'],f"🏆 እንኳን ደስ አለዎት! የአሸናፊ ቁጥር #{int(number)}\n{announcement}")
             except TelegramError: pass
-        await notify_admin(context,f"🏆 የዕጣ ውጤት፦ #{number}\n{html.escape(announcement)}")
+        await notify_admin(context,f"🏆 የዕጣ ውጤት፦ #{int(number)}\n{html.escape(announcement)}")
         return True
     elif state=='content':
         update_setting('support_text',txt); context.user_data.pop('v3_state',None); audit(update.effective_user.id,'update_support'); await update.message.reply_text("Support መረጃ ተቀምጧል።"); return True
@@ -2582,23 +2577,10 @@ async def v3_text_handler(update,context):
         update_setting('pending_payment_hours',txt); context.user_data['v3_state']='drawdate'; await update.message.reply_text("አሁን የዕጣ ቀንና ሰዓት ያስገቡ።"); return True
     elif state=='drawdate':
         update_setting('draw_datetime',txt); context.user_data.pop('v3_state',None); audit(update.effective_user.id,'update_draw_date',txt); await update.message.reply_text("የPending ጊዜና የዕጣ ቀን ተቀምጠዋል።"); return True
+    if state in {'method_name','method_account','method_holder'}:
+        await update.message.reply_text(prompt)
+        return True
     return True
-
-async def set_welcome_photo_command(update, context):
-    if update.effective_user.id != context.bot_data['admin_id']:
-        await update.message.reply_text('አድሚን ብቻ ይህን ማድረግ ይችላል።')
-        return
-    context.user_data['await_welcome_photo'] = True
-    context.user_data.pop('await_tutorial_upload', None)
-    await update.message.reply_text('ለአዲስ ተጠቃሚዎች የሚታየውን የWelcome ፎቶ አሁን ይላኩ።')
-
-async def remove_welcome_photo_command(update, context):
-    if update.effective_user.id != context.bot_data['admin_id']:
-        await update.message.reply_text('አድሚን ብቻ ይህን ማድረግ ይችላል።')
-        return
-    update_setting('welcome_photo_file_id', '')
-    context.user_data.pop('await_welcome_photo', None)
-    await update.message.reply_text('የWelcome ፎቶው ተወግዷል።')
 
 async def tutorial_upload_command(update,context):
     if update.effective_user.id!=context.bot_data['admin_id']:
@@ -2607,25 +2589,12 @@ async def tutorial_upload_command(update,context):
     await update.message.reply_text('አሁን Tutorial ፎቶ ወይም ቪዲዮ ይላኩ።')
 
 async def tutorial_upload_handler(update,context):
-    if update.effective_user.id != context.bot_data['admin_id']:
-        return
-    if context.user_data.get('await_welcome_photo'):
-        if not update.message.photo:
-            await update.message.reply_text('እባክዎ Welcome ለማድረግ ፎቶ ብቻ ይላኩ።')
-            return
-        fid = update.message.photo[-1].file_id
-        update_setting('welcome_photo_file_id', fid)
-        context.user_data.pop('await_welcome_photo', None)
-        await update.message.reply_text('✅ የWelcome ፎቶ ተቀምጧል። ከአሁን በኋላ አዲስ ተጠቃሚዎች /start ሲጫኑ ይህን ፎቶ ያያሉ።')
-        return
-    if not context.user_data.get('await_tutorial_upload'):
-        return
+    if update.effective_user.id!=context.bot_data['admin_id'] or not context.user_data.get('await_tutorial_upload'): return
     if update.message.video:
         fid=update.message.video.file_id; typ='video'
     elif update.message.photo:
         fid=update.message.photo[-1].file_id; typ='photo'
-    else:
-        return
+    else: return
     update_setting('tutorial_file_id',fid); update_setting('tutorial_file_type',typ)
     context.user_data.pop('await_tutorial_upload',None)
     await update.message.reply_text('Tutorial ፋይሉ ተቀምጧል።')
@@ -2746,8 +2715,6 @@ def main():
     application.add_handler(CommandHandler("admin", admin_settings_command))
     application.add_handler(CommandHandler("adminv3", admin_v3_command))
     application.add_handler(CommandHandler("tutorialupload", tutorial_upload_command))
-    application.add_handler(CommandHandler("setwelcomephoto", set_welcome_photo_command))
-    application.add_handler(CommandHandler("removewelcomephoto", remove_welcome_photo_command))
     application.add_handler(
         CallbackQueryHandler(
             ticket_chosen,
