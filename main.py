@@ -262,8 +262,7 @@ def init_db():
                 payment_id INTEGER NOT NULL REFERENCES payments(id),
                 user_id INTEGER NOT NULL,
                 assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (number, half_slot),
-                UNIQUE (payment_id, half_slot)
+                PRIMARY KEY (number, half_slot)
             );
             CREATE INDEX IF NOT EXISTS ticket_allocations_payment
                 ON ticket_allocations(payment_id);
@@ -316,6 +315,17 @@ def init_db():
         ).fetchall()}
         if "payment_method_id" not in payment_columns:
             db.execute("ALTER TABLE payments ADD COLUMN payment_method_id BIGINT")
+        if "ticket_quantity" not in payment_columns:
+            db.execute("ALTER TABLE payments ADD COLUMN ticket_quantity INTEGER NOT NULL DEFAULT 1")
+        if "total_amount" not in payment_columns:
+            db.execute("ALTER TABLE payments ADD COLUMN total_amount NUMERIC NOT NULL DEFAULT 0")
+        # Older versions limited one payment to at most two allocation rows.
+        # Remove that obsolete constraint so one payment can cover multiple tickets.
+        unique_constraints = db.execute("""SELECT conname FROM pg_constraint
+            WHERE conrelid='ticket_allocations'::regclass AND contype='u'
+            AND pg_get_constraintdef(oid) LIKE '%payment_id%half_slot%'""").fetchall()
+        for constraint in unique_constraints:
+            db.execute(f'ALTER TABLE ticket_allocations DROP CONSTRAINT "{constraint["conname"]}"')
         # Additive v3 schema: preserves existing users, payments and allocations.
         user_columns = {row["column_name"] for row in db.execute(
             "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='users'"
@@ -512,8 +522,10 @@ async def payment_method_callback(update, context):
     if ticket_code not in {'full','half'}:
         await q.message.reply_text("እባክዎ የዕጣ አይነት እንደገና ይምረጡ።"); return
     settings=get_settings()
+    quantity = max(1, int(context.user_data.get('ticket_quantity', 1)))
     price=ticket_types(settings)[ticket_code]['price']
-    body=(f"💳 <b>{html.escape(method['name'])}</b>\n\nየሚከፍሉት፦ {format_price(price)} ብር\n"
+    total_price = price * quantity
+    body=(f"💳 <b>{html.escape(method['name'])}</b>\n\nየትኬት ብዛት፦ {quantity}\nየአንዱ ዋጋ፦ {format_price(price)} ብር\n<b>ጠቅላላ ክፍያ፦ {format_price(total_price)} ብር</b>\n"
           f"የሂሳብ/ስልክ ቁጥር፦ <code>{html.escape(method['account'])}</code>\n"
           f"የባለቤት ስም፦ {html.escape(method['holder'])}\n\n"
           f"{html.escape(method['instruction'])}\n\n{html.escape(settings['receipt_instruction'])}")
@@ -768,10 +780,14 @@ def ticket_type_description(ticket_code, settings=None):
     return f"{item['label']} ({format_price(item['price'])} ብር)"
 
 
-def bank_info_text(settings, ticket_code):
+def bank_info_text(settings, ticket_code, quantity=1):
     ticket = ticket_type_description(ticket_code, settings)
+    unit_price = ticket_types(settings)[ticket_code]['price']
+    quantity = max(1, int(quantity or 1))
     return (
-        f"💳 <b>{html.escape(ticket)}</b>\n\n"
+        f"💳 <b>{html.escape(ticket)} × {quantity}</b>\n"
+        f"የአንዱ ዋጋ፦ {format_price(unit_price)} ብር\n"
+        f"<b>ጠቅላላ ክፍያ፦ {format_price(unit_price * quantity)} ብር</b>\n\n"
         f"{html.escape(settings['payment_intro'])}\n\n"
         f"▪️ <b>የባንክ ስም፦</b> <code>{html.escape(settings['bank_name'])}</code>\n"
         f"▪️ <b>የሂሳብ ቁጥር፦</b> <code>{html.escape(settings['bank_account'])}</code>\n"
@@ -913,7 +929,7 @@ def get_active_payment(user_id):
     with db_session() as db:
         return db.execute(
             """
-            SELECT id, ticket_type, status
+            SELECT id, ticket_type, status, ticket_quantity
             FROM payments
             WHERE user_id = ? AND status IN ('pending', 'approved', 'assigned')
             ORDER BY id DESC LIMIT 1
@@ -970,7 +986,7 @@ def get_in_progress_payment(user_id):
     with db_session() as db:
         return db.execute(
             """
-            SELECT id, ticket_type, status
+            SELECT id, ticket_type, status, ticket_quantity
             FROM payments
             WHERE user_id = ? AND status IN ('pending', 'approved')
             ORDER BY id DESC LIMIT 1
@@ -984,7 +1000,7 @@ def get_assignable_payment(payment_id, user_id):
     with db_session() as db:
         payment = db.execute(
             """
-            SELECT status FROM payments
+            SELECT status, ticket_quantity FROM payments
             WHERE id = ? AND user_id = ? AND status IN ('approved', 'assigned')
             """,
             (payment_id, user_id),
@@ -1001,16 +1017,18 @@ def get_assignable_payment(payment_id, user_id):
         return payment
 
 
-def create_payment(user_id, ticket_type, receipt_file_id, ticket_code=None, payment_method_id=None):
+def create_payment(user_id, ticket_type, receipt_file_id, ticket_code=None, payment_method_id=None, quantity=1, total_amount=0):
     with db_session() as db:
         cursor = db.execute(
             """
             INSERT INTO payments
-                (user_id, ticket_type, ticket_code, receipt_file_id, payment_method_id, status)
-            VALUES (?, ?, ?, ?, ?, 'pending')
+                (user_id, ticket_type, ticket_code, receipt_file_id, payment_method_id,
+                 ticket_quantity, total_amount, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
             RETURNING id
             """,
-            (user_id, ticket_type, ticket_code, receipt_file_id, payment_method_id),
+            (user_id, ticket_type, ticket_code, receipt_file_id, payment_method_id,
+             quantity, total_amount),
         )
         return cursor.fetchone()["id"]
 
@@ -1180,7 +1198,7 @@ def number_mode_keyboard(payment_id):
             ],
             [
                 InlineKeyboardButton(
-                    "✨ የዕድል ቁጥሬን በዕድል ይሰጠኝ",
+                    "✨ የዕድል ቁጥሬን በራስ-ሰር ይምረጥ",
                     callback_data=f"mode:auto:{payment_id}",
                 )
             ],
@@ -1205,20 +1223,32 @@ def ticket_selection_keyboard(settings=None):
                 )
             ],
             [InlineKeyboardButton("📋 የቁጥሮችን ሁኔታ እይ", callback_data="view_numbers")],
+            [InlineKeyboardButton("🎟️ ብዙ (ከሁለት በላይ) ለመቁረጥ", callback_data="ticket:multi")],
         ]
     )
+
+
+def multi_ticket_type_keyboard(settings=None):
+    types = ticket_types(settings)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🎫 {types['full']['label']} ({format_price(types['full']['price'])} ብር/አንዱ)", callback_data="multi_type:full")],
+        [InlineKeyboardButton(f"🎟️ {types['half']['label']} ({format_price(types['half']['price'])} ብር/አንዱ)", callback_data="multi_type:half")],
+    ])
 
 
 MY_TICKETS_BUTTON = "የኔ ትኬቶች"
 
 
-def main_menu_keyboard():
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("🎫 የኔ ትኬቶች"), KeyboardButton("🛒 ተጨማሪ ለመቁረጥ")],
-         [KeyboardButton("🔢 የዕጣ ቁጥሮች ሁኔታ"), KeyboardButton("📅 መቼ ይወጣል?")],
-         [KeyboardButton("🆘 እገዛ / Support")]],
-        resize_keyboard=True, is_persistent=True,
-    )
+def main_menu_keyboard(is_admin=False):
+    rows = [[KeyboardButton("🎫 የኔ ትኬቶች"), KeyboardButton("🛒 ተጨማሪ ለመቁረጥ")],
+            [KeyboardButton("🔢 የዕጣ ቁጥሮች ሁኔታ"), KeyboardButton("📅 መቼ ይወጣል?")],
+            [KeyboardButton("🆘 እገዛ / Support")]]
+    if is_admin:
+        rows.extend([[KeyboardButton("⚙️ /admin"), KeyboardButton("🛠 /adminv3")],
+                     [KeyboardButton("🔢 አድሚን ቁጥር ቁጥጥር"), KeyboardButton("👥 ተጠቃሚዎች")],
+                     [KeyboardButton("📎 /tutorialupload"), KeyboardButton("❌ /cancel")],
+                     [KeyboardButton("/start"), KeyboardButton("/Admin"), KeyboardButton("/Adminv3")]])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 
 def buy_ticket_keyboard():
@@ -1347,6 +1377,8 @@ async def registration_contact_handler(update: Update, context: ContextTypes.DEF
 async def show_lottery_menu(update, context, profile):
     user = update.effective_user
     settings = get_settings()
+    if user.id == context.bot_data["admin_id"]:
+        await update.message.reply_text("የአድሚን ቋሚ ቁልፎች፦", reply_markup=main_menu_keyboard(is_admin=True))
     active = get_active_payment(user.id)
 
     if active:
@@ -1362,16 +1394,17 @@ async def show_lottery_menu(update, context, profile):
             )
         else:
             with db_session() as db:
-                ticket = db.execute(
+                tickets = db.execute(
                     """
-                    SELECT number FROM ticket_allocations
-                    WHERE payment_id = ? ORDER BY number LIMIT 1
+                    SELECT DISTINCT number FROM ticket_allocations
+                    WHERE payment_id = ? ORDER BY number
                     """,
                     (active["id"],),
-                ).fetchone()
-            if ticket:
+                ).fetchall()
+            if tickets:
+                number_list = ', '.join(f"#{int(t['number'])}" for t in tickets)
                 await update.message.reply_text(
-                    f"✅ የተመዘገበው የዕድል ቁጥርዎ፦ #{ticket['number']}\n\n"
+                    f"✅ የተመዘገቡት የዕድል ቁጥሮች፦ {number_list}\n\n"
                     "ተጨማሪ ዕጣ ለመግዛት አዲስ የዕጣ አይነት ይምረጡ፦",
                     reply_markup=ticket_selection_keyboard(settings),
                 )
@@ -1397,7 +1430,7 @@ async def show_lottery_menu(update, context, profile):
         parse_mode="HTML",
         reply_markup=ticket_selection_keyboard(settings),
     )
-    await update.message.reply_text("ዋና ማውጫ፦", reply_markup=main_menu_keyboard())
+    await update.message.reply_text("ዋና ማውጫ፦", reply_markup=main_menu_keyboard(is_admin=(user.id == context.bot_data["admin_id"])))
 
 
 async def ticket_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1406,6 +1439,18 @@ async def ticket_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
 
+    if query.data == "ticket:multi":
+        if get_registered_user(query.from_user.id) is None:
+            await query.message.reply_text("እባክዎ መጀመሪያ /start በመጫን ይመዝገቡ።")
+            return
+        active_multi = get_active_payment(query.from_user.id)
+        if active_multi and active_multi['status'] in {'pending', 'approved'}:
+            await query.message.reply_text("⏳ አስቀድሞ የክፍያ ጥያቄ ወይም ያልተመደበ ክፍያ አለዎት። ያንን ሂደት መጀመሪያ ያጠናቅቁ።")
+            return
+        context.user_data['multi_ticket_step'] = 'quantity'
+        context.user_data['ticket_quantity'] = 0
+        await query.message.reply_text("ምን ያህል ትኬት ነው መቁረጥ የምትፈልገው? ከ2 እስከ 100 ያለ ቁጥር አስገባ።")
+        return
     view_match = re.fullmatch(r"view_numbers(?::(\d+))?", query.data or "")
     if view_match:
         await show_numbers_and_auto_delete(query, context, page=int(view_match.group(1) or 0))
@@ -1455,6 +1500,7 @@ async def ticket_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     settings = get_settings()
+    context.user_data["ticket_quantity"] = 1
     context.user_data["ticket_code"] = ticket_code
     context.user_data["ticket_type"] = ticket_type_description(ticket_code, settings)
     await query.message.reply_text(f"ለእርስዎ <b>{html.escape(context.user_data['ticket_type'])}</b> መርጠዋል።",parse_mode="HTML")
@@ -1500,6 +1546,7 @@ async def repeat_selection_handler(update: Update, context: ContextTypes.DEFAULT
         return
 
     settings = get_settings()
+    context.user_data["ticket_quantity"] = 1
     context.user_data["ticket_code"] = ticket_code
     context.user_data["ticket_type"] = ticket_type_description(ticket_code, settings)
     await query.message.reply_text("✅ አዲስ ዕጣ ለመቀጠል የክፍያ አማራጭ ይምረጡ።")
@@ -1536,6 +1583,8 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update.message.photo[-1].file_id,
             ticket_code=ticket_code,
             payment_method_id=context.user_data.get("payment_method_id"),
+            quantity=max(1, int(context.user_data.get("ticket_quantity", 1))),
+            total_amount=(ticket_types(get_settings())[ticket_code]["price"] * max(1, int(context.user_data.get("ticket_quantity", 1)))),
         )
     except psycopg2.IntegrityError:
         await update.message.reply_text(
@@ -1549,6 +1598,8 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📞 <b>ስልክ፦</b> <code>{html.escape(profile['phone_number'])}</code>\n"
         f"🆔 <b>ID፦</b> <code>{user.id}</code>\n"
         f"🎫 <b>አይነት፦</b> {html.escape(ticket_type)}\n"
+        f"🔢 <b>ብዛት፦</b> {max(1, int(context.user_data.get('ticket_quantity', 1)))}\n"
+        f"💰 <b>ጠቅላላ ክፍያ፦</b> {format_price(ticket_types(get_settings())[ticket_code]['price'] * max(1, int(context.user_data.get('ticket_quantity', 1))))} ብር\n"
         f"🔖 <b>ጥያቄ፦</b> <code>#{payment_id}</code>"
     )
     admin_keyboard = InlineKeyboardMarkup(
@@ -1583,6 +1634,8 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("ticket_type", None)
     context.user_data.pop("ticket_code", None)
     context.user_data.pop("payment_method_id", None)
+    context.user_data.pop("ticket_quantity", None)
+    context.user_data.pop("multi_ticket_step", None)
     await update.message.reply_text(
         "⏳ የክፍያ ደረሰኝዎ ለአድሚን ተልኳል። ከጸደቀ በኋላ የዕድል ቁጥር መምረጫው ይከፈትልዎታል።"
     )
@@ -1648,6 +1701,7 @@ async def admin_settings_command(update: Update, context: ContextTypes.DEFAULT_T
         parse_mode="HTML",
         reply_markup=admin_settings_keyboard(),
     )
+    await update.message.reply_text("የአድሚን ቋሚ ማውጫ ከታች አለ።", reply_markup=main_menu_keyboard(is_admin=True))
 
 
 async def admin_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1778,6 +1832,25 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("admin_message_user_id", None)
         await update.message.reply_text("✅ መልእክቱ ተልኳል።")
         return
+    if context.user_data.get('manual_multi_payment_id') is not None:
+        payment_id = int(context.user_data['manual_multi_payment_id'])
+        numbers = context.user_data.setdefault('manual_multi_numbers', [])
+        raw = (update.message.text or '').strip()
+        st = get_settings(); qty = 1
+        with db_session() as db:
+            row = db.execute("SELECT ticket_quantity FROM payments WHERE id=? AND user_id=?", (payment_id, update.effective_user.id)).fetchone()
+        qty = int(row['ticket_quantity'] or 1) if row else 1
+        if not raw.isascii() or not raw.isdigit() or not int(st['first_number']) <= int(raw) <= int(st['last_number']):
+            await update.message.reply_text(f"ከ{st['first_number']} እስከ {st['last_number']} ያለ ቁጥር ያስገቡ።"); return
+        n = int(raw)
+        if n in numbers:
+            await update.message.reply_text("ይህን ቁጥር አስቀድመው መርጠዋል። ሌላ ቁጥር ያስገቡ።"); return
+        numbers.append(n)
+        if len(numbers) < qty:
+            await update.message.reply_text(f"{len(numbers)+1}ኛውን ቁጥር ያስገቡ። ({len(numbers)}/{qty} ተመርጧል)"); return
+        await finish_multiple_selection(update.message.reply_text, payment_id, update.effective_user.id, numbers, context)
+        return
+    if await multi_ticket_text_handler(update, context): return
     if await v3_text_handler(update, context): return
     if await profile_edit_handler(update, context): return
     # An approved payment's manual number entry must be handled before menu fallback.
@@ -1787,7 +1860,7 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if await menu_text_handler(update, context): return
     # Ignore unrelated text safely and return the customer to the service menu.
     if update.message.text and get_registered_user(update.effective_user.id):
-        await update.message.reply_text(feature_menu_text(), reply_markup=main_menu_keyboard())
+        await update.message.reply_text(feature_menu_text(), reply_markup=main_menu_keyboard(is_admin=(update.effective_user.id == context.bot_data.get("admin_id"))))
         return
 
 
@@ -2227,6 +2300,107 @@ async def admin_management_callback(update: Update, context: ContextTypes.DEFAUL
         )
 
 
+def assign_multiple_tickets(payment_id, user_id, requested_numbers=None):
+    settings = get_settings()
+    first, last = int(settings['first_number']), int(settings['last_number'])
+    db = connect_db()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        payment = db.execute("SELECT status,ticket_code,ticket_type,ticket_quantity FROM payments WHERE id=? AND user_id=?", (payment_id,user_id)).fetchone()
+        if not payment or payment['status'] not in {'approved','assigned'}:
+            raise PaymentNotApproved
+        if payment['status'] == 'assigned':
+            rows = db.execute("SELECT DISTINCT number FROM ticket_allocations WHERE payment_id=? ORDER BY number", (payment_id,)).fetchall()
+            db.commit()
+            return [str(int(r['number'])) for r in rows], True
+        qty = max(1, int(payment['ticket_quantity'] or 1))
+        code = infer_ticket_code(payment['ticket_code'], payment['ticket_type'], settings)
+        occupied_rows = db.execute("SELECT number,half_slot FROM ticket_allocations").fetchall()
+        occupied = {}
+        for row in occupied_rows: occupied.setdefault(row['number'], set()).add(int(row['half_slot']))
+        blocked = {r['number'] for r in db.execute("SELECT number FROM blocked_numbers").fetchall()}
+        if requested_numbers is None:
+            pool=[]
+            for n in range(first,last+1):
+                key=f'{n:04d}'; slots=occupied.get(key,set())
+                if key in blocked: continue
+                if code == 'full' and not slots: pool.append(n)
+                elif code == 'half' and len(slots)<2: pool.append(n)
+            if len(pool)<qty: raise NoNumbersAvailable
+            selected=secrets.SystemRandom().sample(pool,qty)
+        else:
+            selected=[int(x) for x in requested_numbers]
+            if len(selected)!=qty or len(set(selected))!=qty or any(n<first or n>last for n in selected):
+                raise ValueError('ቁጥሮቹ ትክክል አይደሉም።')
+        for n in selected:
+            key=f'{n:04d}'; slots=occupied.get(key,set())
+            if key in blocked or (code=='full' and slots) or (code=='half' and len(slots)>=2):
+                raise NumberAlreadyTaken
+            slots_to_use=(1,2) if code=='full' else ((1,) if 1 not in slots else (2,))
+            for slot in slots_to_use:
+                db.execute("INSERT INTO ticket_allocations(number,half_slot,payment_id,user_id) VALUES(?,?,?,?)",(key,slot,payment_id,user_id))
+            occupied[key]=slots.union(slots_to_use)
+        db.execute("UPDATE payments SET status='assigned',ticket_code=? WHERE id=?",(code,payment_id))
+        db.commit()
+        return selected, False
+    except Exception:
+        db.rollback(); raise
+    finally: db.close()
+
+
+async def finish_multiple_selection(send_reply, payment_id, user_id, numbers, context):
+    try:
+        assigned, existed = assign_multiple_tickets(payment_id,user_id,numbers)
+    except (PaymentNotApproved, NumberAlreadyTaken, NoNumbersAvailable, ValueError) as exc:
+        if isinstance(exc, PaymentNotApproved): msg='ክፍያው አልጸደቀም።'
+        elif isinstance(exc, NumberAlreadyTaken): msg='ከተመረጡት ቁጥሮች አንዱ ተይዟል። እባክዎ እንደገና ይምረጡ።'
+        elif isinstance(exc, NoNumbersAvailable): msg='በቂ ክፍት ቁጥሮች የሉም።'
+        else: msg=str(exc)
+        await send_reply(msg)
+        if context.user_data.get('manual_multi_payment_id') == payment_id:
+            context.user_data['manual_multi_numbers'] = []
+            await send_reply("እባክዎ 1ኛውን ቁጥር እንደገና ያስገቡ።")
+        return False
+    numbers_text=', '.join(f'#{int(n)}' for n in assigned)
+    await send_reply(f"🎉 እንኳን ደስ አለዎት!\nየተመደቡልዎት የዕድል ቁጥሮች፦\n<b>{numbers_text}</b>",parse_mode='HTML')
+    context.user_data.pop('manual_multi_payment_id',None); context.user_data.pop('manual_multi_numbers',None)
+    return True
+
+
+async def multi_ticket_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not await require_private_chat(update): return
+    await q.answer()
+    code = (q.data or '').split(':')[-1]
+    quantity = int(context.user_data.get('ticket_quantity', 0))
+    if code not in {'full', 'half'} or quantity < 2:
+        await q.message.reply_text("እባክዎ የትኬት ብዛትን እንደገና ያስገቡ።")
+        return
+    settings = get_settings()
+    context.user_data['ticket_code'] = code
+    context.user_data['ticket_type'] = ticket_type_description(code, settings)
+    context.user_data['multi_ticket_step'] = None
+    total = ticket_types(settings)[code]['price'] * quantity
+    await q.message.reply_text(
+        f"የመረጡት፦ {html.escape(context.user_data['ticket_type'])} × {quantity}\n"
+        f"ጠቅላላ ክፍያ፦ <b>{format_price(total)} ብር</b>\n\nየክፍያ አማራጭ ይምረጡ፦",
+        parse_mode='HTML')
+    await prompt_payment_method(q.message, context, code)
+
+
+async def multi_ticket_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    step = context.user_data.get('multi_ticket_step')
+    if step != 'quantity': return False
+    raw = (update.message.text or '').strip()
+    if not raw.isascii() or not raw.isdigit() or not 2 <= int(raw) <= 100:
+        await update.message.reply_text("ከ2 እስከ 100 ያለ ትክክለኛ የትኬት ብዛት ያስገቡ።")
+        return True
+    context.user_data['ticket_quantity'] = int(raw)
+    context.user_data['multi_ticket_step'] = 'type'
+    await update.message.reply_text("ሙሉ ነው ወይስ በየግማሽ? የትኬት አይነት ይምረጡ፦", reply_markup=multi_ticket_type_keyboard(get_settings()))
+    return True
+
+
 async def number_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await require_private_chat(update):
@@ -2247,8 +2421,19 @@ async def number_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
+    quantity = int(payment['ticket_quantity'] or 1)
+    if quantity > 1 and mode == "manual":
+        context.user_data['manual_multi_payment_id'] = payment_id
+        context.user_data['manual_multi_numbers'] = []
+        await show_numbers_and_auto_delete(query, context, page=0, range_index=0)
+        await query.message.reply_text(f"✏️ 1ኛውን ቁጥር ከ{get_settings()['first_number']} እስከ {get_settings()['last_number']} ያስገቡ። በተራ ይጠይቃል።")
+        return
+    if quantity > 1 and mode == "auto":
+        await finish_multiple_selection(query.message.reply_text, payment_id, query.from_user.id, None, context)
+        return
     if mode == "manual":
         context.user_data["manual_payment_id"] = payment_id
+        await show_numbers_and_auto_delete(query, context, page=0, range_index=0)
         settings = get_settings()
         await query.message.reply_text(
             f"✏️ ከ <b>{int(settings['first_number'])} እስከ "
@@ -2377,7 +2562,8 @@ def public_numbers_keyboard(page, page_count, range_index=0):
     if nav:
         rows.append(nav)
     ranges = [(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000)]
-    rows.append([InlineKeyboardButton(f"{a}-{b}", callback_data=f"view_numbers_range:{i}:0") for i,(a,b) in enumerate(ranges)])
+    for start in (0, 3):
+        rows.append([InlineKeyboardButton(f"{ranges[i][0]}-{ranges[i][1]}", callback_data=f"view_numbers_range:{i}:0") for i in range(start, start + 3)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2450,6 +2636,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("ticket_type", None)
     context.user_data.pop("ticket_code", None)
     context.user_data.pop("manual_payment_id", None)
+    context.user_data.pop("manual_multi_payment_id", None)
+    context.user_data.pop("manual_multi_numbers", None)
+    context.user_data.pop("multi_ticket_step", None)
+    context.user_data.pop("ticket_quantity", None)
+    context.user_data.pop("admin_reserve_number", None)
     context.user_data.pop("admin_setting_edit", None)
     context.user_data.pop("admin_message_user_id", None)
     context.user_data.pop("registration_step", None)
@@ -2457,7 +2648,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("admin_action", None)
     await update.message.reply_text(
         "ሂደቱ ተቋርጧል። ደረሰኝ አስቀድመው ከላኩ የአድሚን ግምገማው ይቀጥላል።",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=main_menu_keyboard(is_admin=(update.effective_user.id == context.bot_data.get("admin_id"))),
     )
 
 
@@ -2482,11 +2673,11 @@ async def show_user_tickets(update, context):
           FROM payments p LEFT JOIN ticket_allocations ta ON ta.payment_id=p.id
           WHERE p.user_id=? GROUP BY p.id ORDER BY p.id DESC LIMIT 30""",(uid,)).fetchall()
     if not rows:
-        await update.message.reply_text("ገና የገዙት ትኬት የለም።",reply_markup=main_menu_keyboard()); return
+        await update.message.reply_text("ገና የገዙት ትኬት የለም።",reply_markup=main_menu_keyboard(is_admin=(update.effective_user.id == context.bot_data.get("admin_id")))); return
     lines=["🎫 <b>የእኔ የግዢ ታሪክ</b>"]
     for r in rows:
         lines.append(f"\n#{r['id']} | {html.escape(r['ticket_type'])}\nቁጥር፦ {html.escape(r['numbers'] or 'ገና አልተመደበም')}\nሁኔታ፦ {html.escape(r['status'])}\nቀን፦ {html.escape(str(r['created_at']))}")
-    await update.message.reply_text("\n".join(lines),parse_mode="HTML",reply_markup=main_menu_keyboard())
+    await update.message.reply_text("\n".join(lines),parse_mode="HTML",reply_markup=main_menu_keyboard(is_admin=(update.effective_user.id == context.bot_data.get("admin_id"))))
 
 async def show_public_number_report(update, context):
     st=get_settings()
@@ -2507,7 +2698,7 @@ async def show_public_number_report(update, context):
          f"በሽያጭ/ምደባ የተያዙ፦ {sold}\n"
          f"የቀሩ ቁጥሮች፦ {remaining}\n\n"+
          (html.escape(manual) if manual else "የአድሚን ተጨማሪ ሪፖርት ገና አልተሞላም።"))
-    await update.message.reply_text(msg,parse_mode="HTML",reply_markup=main_menu_keyboard())
+    await update.message.reply_text(msg,parse_mode="HTML",reply_markup=main_menu_keyboard(is_admin=(update.effective_user.id == context.bot_data.get("admin_id"))))
     # The detailed 100-number list is a separate temporary message, removed after 3 minutes.
     class _PublicQuery:
         data = "view_numbers"
@@ -2517,24 +2708,27 @@ async def show_public_number_report(update, context):
 async def menu_text_handler(update, context):
     txt=(update.message.text or '').strip()
     uid=update.effective_user.id
+    if uid == context.bot_data.get('admin_id'):
+        if txt in {"⚙️ /admin", "/Admin", "/admin"}:
+            await admin_settings_command(update, context); return True
+        if txt in {"🛠 /adminv3", "/Adminv3", "/adminv3"}:
+            await admin_v3_command(update, context); return True
+        if txt == "🔢 አድሚን ቁጥር ቁጥጥር":
+            await update.message.reply_text("የቁጥር ዝርዝር፦", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("የቁጥር ሁኔታ", callback_data="manage:numbers:0")]])); return True
+        if txt == "👥 ተጠቃሚዎች":
+            await update.message.reply_text("ተጠቃሚዎች፦", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("የተጠቃሚዎች ዝርዝር", callback_data="manage:users:0")]])); return True
+        if txt == "📎 /tutorialupload":
+            await tutorial_upload_command(update, context); return True
+        if txt == "❌ /cancel":
+            await cancel(update, context); return True
     if txt in {"🎫 የኔ ትኬቶች", MY_TICKETS_BUTTON}:
         await show_user_tickets(update,context); return True
     if txt=="🔢 የዕጣ ቁጥሮች ሁኔታ":
         await show_public_number_report(update,context); return True
     if txt=="📅 መቼ ይወጣል?":
-        st=get_settings(); await update.message.reply_text(f"📅 <b>የዕጣ ማውጫ መረጃ</b>\n{html.escape(st.get('draw_datetime','Not announced'))}\n{html.escape(st.get('draw_status',''))}",parse_mode="HTML",reply_markup=main_menu_keyboard()); return True
+        st=get_settings(); await update.message.reply_text(f"📅 <b>የዕጣ ማውጫ መረጃ</b>\n{html.escape(st.get('draw_datetime','Not announced'))}\n{html.escape(st.get('draw_status',''))}",parse_mode="HTML",reply_markup=main_menu_keyboard(is_admin=(update.effective_user.id == context.bot_data.get("admin_id")))); return True
     if txt=="🆘 እገዛ / Support":
-        st=get_settings(); await update.message.reply_text(st.get('support_text') or "የSupport መረጃ ገና አልተዘጋጀም።",reply_markup=main_menu_keyboard()); return True
-    if txt=="📚 Tutorial ለማየት":
-        st=get_settings(); await update.message.reply_text(st.get('tutorial_text') or "Tutorial ገና አልተዘጋጀም።",reply_markup=main_menu_keyboard())
-        fid=st.get('tutorial_file_id'); typ=st.get('tutorial_file_type')
-        if fid:
-            if typ=='photo': await context.bot.send_photo(uid,fid)
-            elif typ=='video': await context.bot.send_video(uid,fid)
-        return True
-    if txt=="👤 የግል መረጃ":
-        context.user_data['profile_edit_step']='name'
-        await update.message.reply_text("አዲሱን ሙሉ ስምዎን ያስገቡ። ለመተው /cancel ይጻፉ።",reply_markup=main_menu_keyboard()); return True
+        st=get_settings(); await update.message.reply_text(st.get('support_text') or "የSupport መረጃ ገና አልተዘጋጀም።",reply_markup=main_menu_keyboard(is_admin=(update.effective_user.id == context.bot_data.get("admin_id")))); return True
     if txt in {"🛒 ተጨማሪ ለመቁረጥ","አዲስ ትኬት ለመቁረጥ"}:
         await update.message.reply_text("የዕጣ አይነት ይምረጡ፦",reply_markup=ticket_selection_keyboard(get_settings())); return True
     return False
@@ -2554,6 +2748,7 @@ async def admin_v3_command(update, context):
       [InlineKeyboardButton("⚙️ የጊዜ ገደብ እና ቀን",callback_data="v3:settings")],
     ])
     await update.message.reply_text("🛠 <b>የሸገር ሎተሪ ተጨማሪ አስተዳደር</b>",parse_mode="HTML",reply_markup=kb)
+    await update.message.reply_text("የአድሚን ቋሚ ቁልፎች፦", reply_markup=main_menu_keyboard(is_admin=True))
 
 async def v3_callback(update,context):
     q=update.callback_query
@@ -2709,7 +2904,7 @@ async def profile_edit_handler(update,context):
             db.execute("INSERT INTO user_profile_history(user_id,old_name,new_name,old_phone,new_phone,old_address,new_address) VALUES(?,?,?,?,?,?,?)",(update.effective_user.id,old['display_name'],newname,old['phone_number'],newphone,old['address'] or '',address))
         context.user_data.pop('profile_edit_step',None)
         await notify_admin(context,f"👤 የተጠቃሚ መረጃ ተቀይሯል\nID: <code>{update.effective_user.id}</code>\nስም: {html.escape(newname)}\nስልክ: {html.escape(newphone)}\nአድራሻ: {html.escape(address or 'አልተሰጠም')}",parse_mode='HTML')
-        await update.message.reply_text('መረጃዎ ተዘምኗል።',reply_markup=main_menu_keyboard()); return True
+        await update.message.reply_text('መረጃዎ ተዘምኗል።',reply_markup=main_menu_keyboard(is_admin=(update.effective_user.id == context.bot_data.get("admin_id")))); return True
     return False
 
 async def expire_pending_job(context):
@@ -2806,7 +3001,7 @@ def main():
     application.add_handler(
         CallbackQueryHandler(
             ticket_chosen,
-            pattern=r"^(ticket:(full|half)|view_numbers(?::\d+)?|view_numbers_range:\d+:\d+|view_numbers_page:\d+:\d+)$",
+            pattern=r"^(ticket:(full|half|multi)|view_numbers(?::\d+)?|view_numbers_range:\d+:\d+|view_numbers_page:\d+:\d+)$",
         )
     )
     application.add_handler(
@@ -2824,6 +3019,7 @@ def main():
     application.add_handler(CallbackQueryHandler(v3_callback, pattern=r"^v3:"))
     application.add_handler(CallbackQueryHandler(payment_method_callback, pattern=r"^paymethod:\d+$"))
     application.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO), tutorial_upload_handler), group=1)
+    application.add_handler(CallbackQueryHandler(multi_ticket_type_handler, pattern=r"^multi_type:(full|half)$"))
     application.add_handler(
         CallbackQueryHandler(number_mode_handler, pattern=r"^mode:(auto|manual):\d+$")
     )
