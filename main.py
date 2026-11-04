@@ -287,6 +287,8 @@ def init_db():
         ).fetchall()}
         if "reserved_name" not in blocked_columns:
             db.execute("ALTER TABLE blocked_numbers ADD COLUMN reserved_name TEXT")
+        # Telegram user IDs are 64-bit. Older schemas may have created_by as INTEGER (int4).
+        db.execute("ALTER TABLE blocked_numbers ALTER COLUMN created_by TYPE BIGINT USING created_by::BIGINT")
         payment_columns = {
             row["column_name"]
             for row in db.execute(
@@ -680,27 +682,24 @@ def reserve_number(number, admin_id, reserved_name=""):
     settings = get_settings()
     if not (int(settings["first_number"]) <= int(number) <= int(settings["last_number"])):
         raise ValueError("ቁጥሩ በአሁኑ የዕጣ ክልል ውስጥ አይደለም።")
-    db = connect_db()
     try:
-        db.execute("BEGIN IMMEDIATE")
-        occupied = db.execute(
-            "SELECT 1 FROM ticket_allocations WHERE number = ? LIMIT 1", (number,)
-        ).fetchone()
-        blocked = db.execute(
-            "SELECT 1 FROM blocked_numbers WHERE number = ?", (number,)
-        ).fetchone()
-        if occupied or blocked:
-            raise NumberAlreadyTaken
-        db.execute(
-            "INSERT INTO blocked_numbers (number, created_by, reserved_name) VALUES (?, ?, ?)",
-            (number, admin_id, (reserved_name or "").strip() or None),
-        )
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+        # db_session provides one PostgreSQL transaction; do not issue BEGIN IMMEDIATE.
+        with db_session() as db:
+            occupied = db.execute(
+                "SELECT 1 FROM ticket_allocations WHERE number = ? LIMIT 1", (number,)
+            ).fetchone()
+            blocked = db.execute(
+                "SELECT 1 FROM blocked_numbers WHERE number = ?", (number,)
+            ).fetchone()
+            if occupied or blocked:
+                raise NumberAlreadyTaken
+            db.execute(
+                "INSERT INTO blocked_numbers (number, created_by, reserved_name) VALUES (?, ?, ?)",
+                (number, int(admin_id), (reserved_name or "").strip() or None),
+            )
+    except psycopg2.IntegrityError as exc:
+        # Concurrent reservation attempts can race; the primary key is the final guard.
+        raise NumberAlreadyTaken from exc
 
 
 def release_admin_block(number):
@@ -1246,8 +1245,7 @@ def main_menu_keyboard(is_admin=False):
     if is_admin:
         rows.extend([[KeyboardButton("⚙️ /admin"), KeyboardButton("🛠 /adminv3")],
                      [KeyboardButton("🔢 አድሚን ቁጥር ቁጥጥር"), KeyboardButton("👥 ተጠቃሚዎች")],
-                     [KeyboardButton("📌 የኔ Reserve"), KeyboardButton("📎 /tutorialupload")],
-                     [KeyboardButton("❌ /cancel")],
+                     [KeyboardButton("📎 /tutorialupload"), KeyboardButton("❌ /cancel")],
                      [KeyboardButton("/start"), KeyboardButton("/Admin"), KeyboardButton("/Adminv3")]])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
@@ -1791,9 +1789,12 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             audit(update.effective_user.id, "reserve_number_named", f"{number}:{reserved_name}")
         except (NumberAlreadyTaken, ValueError) as exc:
             await update.message.reply_text(str(exc) if isinstance(exc, ValueError) else "ቁጥሩ ቀድሞ ተይዟል።")
-        except Exception:
-            logger.exception("Admin reserve failed for number %s", number)
-            await update.message.reply_text("❌ Reserve ማድረጉ አልተሳካም። የDatabase ስህተት ተፈጥሯል፤ እባክዎ ደግመው ይሞክሩ።")
+        except Exception as exc:
+            logger.exception("Admin reserve failed (number=%s, admin_id=%s)", number, update.effective_user.id)
+            await update.message.reply_text(
+                "❌ Reserve አልተሳካም። የDatabase ስህተት ተፈጥሯል። "
+                f"የስህተት አይነት፦ {type(exc).__name__}. እባክዎ Render Logs ያረጋግጡ።"
+            )
         context.user_data.pop("admin_reserve_number", None)
         return
 
@@ -2081,23 +2082,6 @@ def admin_user_detail_keyboard(user_id, offset):
     )
 
 
-async def show_admin_my_reserves(update, context):
-    admin_id = update.effective_user.id
-    with db_session() as db:
-        rows = db.execute("SELECT number, reserved_name, created_at FROM blocked_numbers WHERE created_by=? ORDER BY CAST(number AS INTEGER) LIMIT 100", (admin_id,)).fetchall()
-    if not rows:
-        await update.message.reply_text("📌 በእርስዎ የተደረገ Reserve የለም።", reply_markup=main_menu_keyboard(is_admin=True))
-        return
-    lines = ["📌 <b>የኔ Reserve ዝርዝር</b>"]
-    buttons = []
-    for row in rows:
-        number = int(row["number"])
-        name = html.escape(row["reserved_name"] or "ስም አልተመዘገበም")
-        lines.append(f"\n🔒 <b>{number}</b> — {name}")
-        buttons.append([InlineKeyboardButton(f"🔓 {number} — ነፃ አውጣ", callback_data=f"manage:confirm_unblock:{number}:0")])
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
-
-
 async def admin_management_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await require_private_chat(update):
@@ -2110,21 +2094,6 @@ async def admin_management_callback(update: Update, context: ContextTypes.DEFAUL
     context.user_data.pop("admin_setting_edit", None)
     if not data.startswith("manage:message:"):
         context.user_data.pop("admin_message_user_id", None)
-
-    if data == "manage:my_reserves":
-        with db_session() as db:
-            rows = db.execute("SELECT number, reserved_name FROM blocked_numbers WHERE created_by=? ORDER BY CAST(number AS INTEGER) LIMIT 100", (query.from_user.id,)).fetchall()
-        if not rows:
-            await query.message.reply_text("📌 በእርስዎ የተደረገ Reserve የለም")
-            return
-        lines = ["📌 <b>የኔ Reserve ዝርዝር</b>"]
-        buttons = []
-        for row in rows:
-            number = int(row["number"])
-            lines.append(f"\n🔒 <b>{number}</b> — {html.escape(row['reserved_name'] or 'ስም የለም')}")
-            buttons.append([InlineKeyboardButton(f"🔓 {number} — ነፃ አውጣ", callback_data=f"manage:confirm_unblock:{number}:0")])
-        await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
-        return
 
     if data == "manage:home":
         await edit_admin_view(
@@ -2314,27 +2283,10 @@ async def admin_management_callback(update: Update, context: ContextTypes.DEFAUL
         if user_id == context.bot_data["admin_id"]:
             await query.message.reply_text("የአድሚን መለያ ከዚህ ሊሰረዝ አይችልም።")
             return
-        # Notify the user before deleting their profile and releasing their sold numbers.
-        removal_notice = (
-            "ከሎተሪ ፕሮግራሙ ተሰርዘዋል፤ ያዙትን የዕድል ቁጥሮች ተቀምተዋል። "
-            "የከፈሉት ገንዘብ ከዚህ ቀደም ባስተላለፉበት አካውንት ተመላሽ ይደረጋል።\n\n"
-            "እንደገና ለመመዝገብ /start ብለው ይመዝገቡ።"
-        )
-        try:
-            await context.bot.send_message(chat_id=user_id, text=removal_notice)
-            notice_sent = True
-        except TelegramError:
-            notice_sent = False
-            logger.warning("Could not deliver account-removal notice to Telegram user %s", user_id)
-        # Preserve payment history for audit, but remove all ticket claims and old profile.
         with db_session() as db:
-            db.execute("DELETE FROM ticket_allocations WHERE user_id=?", (user_id,))
-            db.execute("DELETE FROM tickets WHERE user_id=?", (user_id,))
-            db.execute("UPDATE payments SET status='failed' WHERE user_id=? AND status IN ('approved','assigned')", (user_id,))
-            db.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-        audit(query.from_user.id, "delete_user_and_release_tickets", f"user_id={user_id};notice_sent={notice_sent}")
-        status_note = "ማሳወቂያው ተልኳል።" if notice_sent else "ማሳወቂያው መላክ አልተቻለም (User ቦቱን አግዶ ሊሆን ይችላል)።"
-        await query.message.reply_text(f"✅ User ተሰርዟል። የያዛቸው የዕጣ ቁጥሮች ነፃ ሆነዋል። የክፍያ ታሪኩ ለAudit ተጠብቋል።\n{status_note} የገንዘብ ተመላሽ በባንክ በእጅ መፈጸም አለበት።")
+            result = db.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+        audit(query.from_user.id, "delete_user_profile", str(user_id))
+        await query.message.reply_text("✅ የተጠቃሚው የቦት መገለጫ ተሰርዟል። የክፍያ/ትኬት ታሪኩ ግን ተጠብቋል።")
         await show_admin_users_page(query, offset)
         return
 
@@ -2770,8 +2722,6 @@ async def menu_text_handler(update, context):
             await update.message.reply_text("የቁጥር ዝርዝር፦", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("የቁጥር ሁኔታ", callback_data="manage:numbers:0")]])); return True
         if txt == "👥 ተጠቃሚዎች":
             await update.message.reply_text("ተጠቃሚዎች፦", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("የተጠቃሚዎች ዝርዝር", callback_data="manage:users:0")]])); return True
-        if txt == "📌 የኔ Reserve":
-            await show_admin_my_reserves(update, context); return True
         if txt == "📎 /tutorialupload":
             await tutorial_upload_command(update, context); return True
         if txt == "❌ /cancel":
@@ -2828,30 +2778,43 @@ async def v3_callback(update,context):
         with db_session() as db: db.execute("UPDATE payment_methods SET active=FALSE WHERE id=?",(mid,))
         audit(q.from_user.id,'disable_payment_method',str(mid)); await q.message.reply_text("የክፍያ አማራጩ ተዘግቷል።"); return
     if q.data=='v3:broadcast:confirm':
-        body=context.user_data.pop('v3_broadcast_body',None)
+        body=context.user_data.get('v3_broadcast_body')
+        if not body:
+            context.user_data.pop('v3_state',None)
+            await q.message.reply_text('የBroadcast ጽሑፍ አልተገኘም። እባክዎ /adminv3 በመጻፍ እንደገና ይጀምሩ።')
+            return
+        context.user_data.pop('v3_broadcast_body',None)
         context.user_data.pop('v3_state',None)
-        if not body: await q.message.reply_text('የBroadcast ጽሑፍ አልተገኘም።'); return
-        with db_session() as db: users=db.execute("SELECT user_id FROM users ORDER BY user_id").fetchall()
-        sent=failed=0
-        for u in users:
-            try:
-                await context.bot.send_message(chat_id=u['user_id'], text=body)
-                sent += 1
-            except RetryAfter as exc:
-                delay = getattr(exc, 'retry_after', 1)
-                delay = delay.total_seconds() if hasattr(delay, 'total_seconds') else float(delay)
-                await asyncio.sleep(delay + 1)
+        progress = await q.message.reply_text('📣 Broadcast ተጀምሯል፤ እባክዎ ይጠብቁ...')
+        try:
+            with db_session() as db:
+                users=db.execute("SELECT user_id FROM users ORDER BY user_id").fetchall()
+            sent=failed=0
+            for u in users:
                 try:
-                    await context.bot.send_message(chat_id=u['user_id'], text=body)
+                    await context.bot.send_message(chat_id=int(u['user_id']), text=body)
                     sent += 1
-                except TelegramError:
+                except RetryAfter as exc:
+                    delay=getattr(exc,'retry_after',1)
+                    delay=delay.total_seconds() if hasattr(delay,'total_seconds') else float(delay)
+                    await asyncio.sleep(max(1.0,delay)+0.5)
+                    try:
+                        await context.bot.send_message(chat_id=int(u['user_id']), text=body)
+                        sent += 1
+                    except TelegramError as retry_exc:
+                        failed += 1
+                        logger.warning("Broadcast retry failed for a user (%s)",type(retry_exc).__name__)
+                except TelegramError as exc:
                     failed += 1
-            except TelegramError:
-                failed += 1
-            await asyncio.sleep(0.10)
-        with db_session() as db: db.execute("INSERT INTO broadcast_log(admin_id,body,sent_count,failed_count) VALUES(?,?,?,?)",(q.from_user.id,body,sent,failed))
-        audit(q.from_user.id,'broadcast',f'sent={sent},failed={failed}')
-        await q.message.reply_text(f'Broadcast ተጠናቋል። የተላከ፦ {sent} | ያልደረሰ፦ {failed}')
+                    logger.warning("Broadcast delivery failed for a user (%s)",type(exc).__name__)
+                await asyncio.sleep(0.05)
+            with db_session() as db:
+                db.execute("INSERT INTO broadcast_log(admin_id,body,sent_count,failed_count) VALUES(?,?,?,?)",(q.from_user.id,body,sent,failed))
+            audit(q.from_user.id,'broadcast',f'sent={sent},failed={failed}')
+            await progress.edit_text(f'✅ Broadcast ተጠናቋል።\nየተላከ፦ {sent}\nያልደረሰ፦ {failed}\nጠቅላላ፦ {len(users)}')
+        except Exception as exc:
+            logger.exception("Broadcast failed before completion")
+            await progress.edit_text(f'❌ Broadcast ተቋርጧል። የስህተት አይነት፦ {type(exc).__name__}. Render Logs ያረጋግጡ።')
         return
     if q.data=='v3:broadcast:cancel':
         context.user_data.pop('v3_broadcast_body',None); context.user_data.pop('v3_state',None)
