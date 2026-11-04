@@ -323,7 +323,7 @@ def init_db():
         # Remove that obsolete constraint so one payment can cover multiple tickets.
         unique_constraints = db.execute("""SELECT conname FROM pg_constraint
             WHERE conrelid='ticket_allocations'::regclass AND contype='u'
-            AND pg_get_constraintdef(oid) LIKE '%payment_id%half_slot%'""").fetchall()
+            AND pg_get_constraintdef(oid) LIKE '%%payment_id%%half_slot%%'""").fetchall()
         for constraint in unique_constraints:
             db.execute(f'ALTER TABLE ticket_allocations DROP CONSTRAINT "{constraint["conname"]}"')
         # Additive v3 schema: preserves existing users, payments and allocations.
