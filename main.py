@@ -535,7 +535,7 @@ async def payment_method_callback(update, context):
         body,
         parse_mode='HTML',
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-            "📋 የሂሳብ ቁጥሩን ቅዳ", copy_text=CopyTextButton(text=method['account'])
+            "📋 የሂሳብ ቁጥሩን Copy ለማድረግ", copy_text=CopyTextButton(text=method['account'])
         )]]),
     )
 
@@ -800,19 +800,9 @@ def bank_info_keyboard(settings):
         [
             [
                 InlineKeyboardButton(
-                    "📋 የሂሳብ ቁጥሩን ቅዳ",
+                    "📋 የሂሳብ ቁጥሩን Copy ለማድረግ",
                     copy_text=CopyTextButton(text=settings["bank_account"]),
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📋 የባንክ ስም ቅዳ",
-                    copy_text=CopyTextButton(text=settings["bank_name"]),
-                ),
-                InlineKeyboardButton(
-                    "📋 የባለቤት ስም ቅዳ",
-                    copy_text=CopyTextButton(text=settings["account_holder"]),
-                ),
             ],
         ]
     )
