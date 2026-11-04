@@ -1246,7 +1246,8 @@ def main_menu_keyboard(is_admin=False):
     if is_admin:
         rows.extend([[KeyboardButton("⚙️ /admin"), KeyboardButton("🛠 /adminv3")],
                      [KeyboardButton("🔢 አድሚን ቁጥር ቁጥጥር"), KeyboardButton("👥 ተጠቃሚዎች")],
-                     [KeyboardButton("📎 /tutorialupload"), KeyboardButton("❌ /cancel")],
+                     [KeyboardButton("📌 የኔ Reserve"), KeyboardButton("📎 /tutorialupload")],
+                     [KeyboardButton("❌ /cancel")],
                      [KeyboardButton("/start"), KeyboardButton("/Admin"), KeyboardButton("/Adminv3")]])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
@@ -1790,6 +1791,9 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             audit(update.effective_user.id, "reserve_number_named", f"{number}:{reserved_name}")
         except (NumberAlreadyTaken, ValueError) as exc:
             await update.message.reply_text(str(exc) if isinstance(exc, ValueError) else "ቁጥሩ ቀድሞ ተይዟል።")
+        except Exception:
+            logger.exception("Admin reserve failed for number %s", number)
+            await update.message.reply_text("❌ Reserve ማድረጉ አልተሳካም። የDatabase ስህተት ተፈጥሯል፤ እባክዎ ደግመው ይሞክሩ።")
         context.user_data.pop("admin_reserve_number", None)
         return
 
@@ -2077,6 +2081,23 @@ def admin_user_detail_keyboard(user_id, offset):
     )
 
 
+async def show_admin_my_reserves(update, context):
+    admin_id = update.effective_user.id
+    with db_session() as db:
+        rows = db.execute("SELECT number, reserved_name, created_at FROM blocked_numbers WHERE created_by=? ORDER BY CAST(number AS INTEGER) LIMIT 100", (admin_id,)).fetchall()
+    if not rows:
+        await update.message.reply_text("📌 በእርስዎ የተደረገ Reserve የለም።", reply_markup=main_menu_keyboard(is_admin=True))
+        return
+    lines = ["📌 <b>የኔ Reserve ዝርዝር</b>"]
+    buttons = []
+    for row in rows:
+        number = int(row["number"])
+        name = html.escape(row["reserved_name"] or "ስም አልተመዘገበም")
+        lines.append(f"\n🔒 <b>{number}</b> — {name}")
+        buttons.append([InlineKeyboardButton(f"🔓 {number} — ነፃ አውጣ", callback_data=f"manage:confirm_unblock:{number}:0")])
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+
+
 async def admin_management_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await require_private_chat(update):
@@ -2089,6 +2110,21 @@ async def admin_management_callback(update: Update, context: ContextTypes.DEFAUL
     context.user_data.pop("admin_setting_edit", None)
     if not data.startswith("manage:message:"):
         context.user_data.pop("admin_message_user_id", None)
+
+    if data == "manage:my_reserves":
+        with db_session() as db:
+            rows = db.execute("SELECT number, reserved_name FROM blocked_numbers WHERE created_by=? ORDER BY CAST(number AS INTEGER) LIMIT 100", (query.from_user.id,)).fetchall()
+        if not rows:
+            await query.message.reply_text("📌 በእርስዎ የተደረገ Reserve የለም")
+            return
+        lines = ["📌 <b>የኔ Reserve ዝርዝር</b>"]
+        buttons = []
+        for row in rows:
+            number = int(row["number"])
+            lines.append(f"\n🔒 <b>{number}</b> — {html.escape(row['reserved_name'] or 'ስም የለም')}")
+            buttons.append([InlineKeyboardButton(f"🔓 {number} — ነፃ አውጣ", callback_data=f"manage:confirm_unblock:{number}:0")])
+        await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+        return
 
     if data == "manage:home":
         await edit_admin_view(
@@ -2278,10 +2314,27 @@ async def admin_management_callback(update: Update, context: ContextTypes.DEFAUL
         if user_id == context.bot_data["admin_id"]:
             await query.message.reply_text("የአድሚን መለያ ከዚህ ሊሰረዝ አይችልም።")
             return
+        # Notify the user before deleting their profile and releasing their sold numbers.
+        removal_notice = (
+            "ከሎተሪ ፕሮግራሙ ተሰርዘዋል፤ ያዙትን የዕድል ቁጥሮች ተቀምተዋል። "
+            "የከፈሉት ገንዘብ ከዚህ ቀደም ባስተላለፉበት አካውንት ተመላሽ ይደረጋል።\n\n"
+            "እንደገና ለመመዝገብ /start ብለው ይመዝገቡ።"
+        )
+        try:
+            await context.bot.send_message(chat_id=user_id, text=removal_notice)
+            notice_sent = True
+        except TelegramError:
+            notice_sent = False
+            logger.warning("Could not deliver account-removal notice to Telegram user %s", user_id)
+        # Preserve payment history for audit, but remove all ticket claims and old profile.
         with db_session() as db:
-            result = db.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-        audit(query.from_user.id, "delete_user_profile", str(user_id))
-        await query.message.reply_text("✅ የተጠቃሚው የቦት መገለጫ ተሰርዟል። የክፍያ/ትኬት ታሪኩ ግን ተጠብቋል።")
+            db.execute("DELETE FROM ticket_allocations WHERE user_id=?", (user_id,))
+            db.execute("DELETE FROM tickets WHERE user_id=?", (user_id,))
+            db.execute("UPDATE payments SET status='failed' WHERE user_id=? AND status IN ('approved','assigned')", (user_id,))
+            db.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+        audit(query.from_user.id, "delete_user_and_release_tickets", f"user_id={user_id};notice_sent={notice_sent}")
+        status_note = "ማሳወቂያው ተልኳል።" if notice_sent else "ማሳወቂያው መላክ አልተቻለም (User ቦቱን አግዶ ሊሆን ይችላል)።"
+        await query.message.reply_text(f"✅ User ተሰርዟል። የያዛቸው የዕጣ ቁጥሮች ነፃ ሆነዋል። የክፍያ ታሪኩ ለAudit ተጠብቋል።\n{status_note} የገንዘብ ተመላሽ በባንክ በእጅ መፈጸም አለበት።")
         await show_admin_users_page(query, offset)
         return
 
@@ -2717,6 +2770,8 @@ async def menu_text_handler(update, context):
             await update.message.reply_text("የቁጥር ዝርዝር፦", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("የቁጥር ሁኔታ", callback_data="manage:numbers:0")]])); return True
         if txt == "👥 ተጠቃሚዎች":
             await update.message.reply_text("ተጠቃሚዎች፦", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("የተጠቃሚዎች ዝርዝር", callback_data="manage:users:0")]])); return True
+        if txt == "📌 የኔ Reserve":
+            await show_admin_my_reserves(update, context); return True
         if txt == "📎 /tutorialupload":
             await tutorial_upload_command(update, context); return True
         if txt == "❌ /cancel":
