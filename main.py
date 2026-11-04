@@ -2556,7 +2556,7 @@ def public_numbers_keyboard(page, page_count, range_index=0):
         nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"view_numbers_page:{range_index}:{page + 1}"))
     if nav:
         rows.append(nav)
-    ranges = [(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000)]
+    ranges = [(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000),(6001,7000),(7001-8000),(8001-9000)]
     for start in (0, 3):
         rows.append([InlineKeyboardButton(f"{ranges[i][0]}-{ranges[i][1]}", callback_data=f"view_numbers_range:{i}:0") for i in range(start, start + 3)])
     return InlineKeyboardMarkup(rows)
@@ -2566,7 +2566,7 @@ async def show_numbers_and_auto_delete(query, context, page=0, range_index=0):
     settings = get_settings()
     configured_first = int(settings["first_number"])
     configured_last = int(settings["last_number"])
-    ranges = [(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000)]
+    ranges = [[(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000),(6001,7000),(7001-8000),(8001-9000)]
     range_index = max(0, min(int(range_index), 5))
     range_first, range_last = ranges[range_index]
     first_number = max(configured_first, range_first)
