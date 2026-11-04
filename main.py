@@ -273,7 +273,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS blocked_numbers (
                 number TEXT PRIMARY KEY,
                 created_by INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                reserved_name TEXT
             );
 
             CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -282,6 +283,11 @@ def init_db():
             );
             """
         )
+        blocked_columns = {row["column_name"] for row in db.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='blocked_numbers'"
+        ).fetchall()}
+        if "reserved_name" not in blocked_columns:
+            db.execute("ALTER TABLE blocked_numbers ADD COLUMN reserved_name TEXT")
         payment_columns = {
             row["column_name"]
             for row in db.execute(
@@ -657,7 +663,7 @@ def is_number_blocked(number):
         ).fetchone() is not None
 
 
-def reserve_number(number, admin_id):
+def reserve_number(number, admin_id, reserved_name=""):
     number = canonical_number(number)
     settings = get_settings()
     if not (int(settings["first_number"]) <= int(number) <= int(settings["last_number"])):
@@ -674,8 +680,8 @@ def reserve_number(number, admin_id):
         if occupied or blocked:
             raise NumberAlreadyTaken
         db.execute(
-            "INSERT INTO blocked_numbers (number, created_by) VALUES (?, ?)",
-            (number, admin_id),
+            "INSERT INTO blocked_numbers (number, created_by, reserved_name) VALUES (?, ?, ?)",
+            (number, admin_id, (reserved_name or "").strip() or None),
         )
         db.commit()
     except Exception:
@@ -1174,7 +1180,7 @@ def number_mode_keyboard(payment_id):
             ],
             [
                 InlineKeyboardButton(
-                    "✨ የዕድል ቁጥሬን በራስ-ሰር ይምረጥ",
+                    "✨ የዕድል ቁጥሬን በዕድል ይሰጠኝ",
                     callback_data=f"mode:auto:{payment_id}",
                 )
             ],
@@ -1210,8 +1216,7 @@ def main_menu_keyboard():
     return ReplyKeyboardMarkup(
         [[KeyboardButton("🎫 የኔ ትኬቶች"), KeyboardButton("🛒 ተጨማሪ ለመቁረጥ")],
          [KeyboardButton("🔢 የዕጣ ቁጥሮች ሁኔታ"), KeyboardButton("📅 መቼ ይወጣል?")],
-         [KeyboardButton("👤 የግል መረጃ"), KeyboardButton("🆘 እገዛ / Support")],
-         [KeyboardButton("📚 Tutorial ለማየት")]],
+         [KeyboardButton("🆘 እገዛ / Support")]],
         resize_keyboard=True, is_persistent=True,
     )
 
@@ -1403,9 +1408,17 @@ async def ticket_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     view_match = re.fullmatch(r"view_numbers(?::(\d+))?", query.data or "")
     if view_match:
-        await show_numbers_and_auto_delete(
-            query, context, page=int(view_match.group(1) or 0)
-        )
+        await show_numbers_and_auto_delete(query, context, page=int(view_match.group(1) or 0))
+        return
+    range_match = re.fullmatch(r"view_numbers_range:(\d+):(\d+)", query.data or "")
+    if range_match:
+        range_index, page = map(int, range_match.groups())
+        await show_numbers_and_auto_delete(query, context, page=page, range_index=range_index)
+        return
+    page_match = re.fullmatch(r"view_numbers_page:(\d+):(\d+)", query.data or "")
+    if page_match:
+        range_index, page = map(int, page_match.groups())
+        await show_numbers_and_auto_delete(query, context, page=page, range_index=range_index)
         return
 
     if get_registered_user(query.from_user.id) is None:
@@ -1707,6 +1720,25 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await complete_registration(update, context, phone_number)
         return
 
+    reserve_state = context.user_data.get("admin_reserve_number")
+    if reserve_state:
+        if update.effective_user.id != context.bot_data["admin_id"]:
+            context.user_data.pop("admin_reserve_number", None)
+            return
+        reserved_name = " ".join((update.message.text or "").split())
+        if len(reserved_name) < 2 or len(reserved_name) > 80:
+            await update.message.reply_text("እባክዎ ከ2 እስከ 80 ፊደል ያለውን ስም ያስገቡ።")
+            return
+        number, page = reserve_state
+        try:
+            reserve_number(number, update.effective_user.id, reserved_name)
+            await update.message.reply_text(f"✅ ቁጥር {int(number)} በ{html.escape(reserved_name)} ስም ተይዟል።", parse_mode="HTML")
+            audit(update.effective_user.id, "reserve_number_named", f"{number}:{reserved_name}")
+        except (NumberAlreadyTaken, ValueError) as exc:
+            await update.message.reply_text(str(exc) if isinstance(exc, ValueError) else "ቁጥሩ ቀድሞ ተይዟል።")
+        context.user_data.pop("admin_reserve_number", None)
+        return
+
     field = context.user_data.get("admin_setting_edit")
     if field:
         if update.effective_user.id != context.bot_data["admin_id"]:
@@ -1895,7 +1927,10 @@ async def show_admin_number_detail(query, number, page):
         "",
     ]
     if blocked:
-        lines.append("⛔ በአድሚን ተይዟል።")
+        with db_session() as db:
+            reserved_row = db.execute("SELECT reserved_name FROM blocked_numbers WHERE number=?", (canonical_number(number),)).fetchone()
+        reserved_name = (reserved_row["reserved_name"] if reserved_row else None)
+        lines.append("⛔ በአድሚን ተይዟል።" + (f" · 👤 {html.escape(reserved_name)}" if reserved_name else ""))
     for allocation in allocations:
         code = infer_ticket_code(
             allocation["ticket_code"], allocation["ticket_type"], settings
@@ -1958,6 +1993,7 @@ def admin_user_detail_keyboard(user_id, offset):
                     callback_data=f"manage:message:{user_id}:{offset}",
                 )
             ],
+            [InlineKeyboardButton("🗑️ ተጠቃሚውን ከቦቱ ሰርዝ", callback_data=f"manage:delete_user:{user_id}:{offset}")],
             [
                 InlineKeyboardButton(
                     "⬅️ ወደ ተጠቃሚዎች",
@@ -2024,12 +2060,12 @@ async def admin_management_callback(update: Update, context: ContextTypes.DEFAUL
     if match:
         number, page = match.groups()
         try:
-            reserve_number(number, query.from_user.id)
-            await query.message.reply_text(f"✅ ቁጥር {number} ተይዟል።")
-        except (NumberAlreadyTaken, ValueError) as exc:
-            message = str(exc) if isinstance(exc, ValueError) else "ቁጥሩ ቀድሞ ተይዟል።"
-            await query.message.reply_text(message)
-        await show_admin_number_page(query, int(page))
+            if is_number_blocked(number) or get_number_states(int(number), int(number)).get(str(int(number))) != "available":
+                raise NumberAlreadyTaken
+            context.user_data["admin_reserve_number"] = (number, int(page))
+            await query.message.reply_text(f"ቁጥር {int(number)}ን በማን ስም ልያዝ? የተቆራጩን/የተያዘለትን ስም ይጻፉ።")
+        except (NumberAlreadyTaken, ValueError):
+            await query.message.reply_text("ቁጥሩ ቀድሞ ተይዟል።")
         return
 
     match = re.fullmatch(r"manage:unblock:(\d{1,4}):(\d+)", data)
@@ -2152,6 +2188,28 @@ async def admin_management_callback(update: Update, context: ContextTypes.DEFAUL
         await edit_admin_view(
             query, text, admin_user_detail_keyboard(user_id, offset)
         )
+        return
+
+    match = re.fullmatch(r"manage:delete_user:(\d+):(\d+)", data)
+    if match:
+        user_id, offset = map(int, match.groups())
+        if user_id == context.bot_data["admin_id"]:
+            await query.message.reply_text("የአድሚን መለያ ከዚህ ሊሰረዝ አይችልም።")
+            return
+        await edit_admin_view(query, f"Telegram ID <code>{user_id}</code> የተጠቃሚ መለያን ከቦቱ መሰረዝ ይፈልጋሉ?\nየክፍያና የትኬት ታሪክ ለሂሳብ መዝገብ ይቀመጣል።", InlineKeyboardMarkup([[InlineKeyboardButton("⚠️ አዎ፣ ሰርዝ", callback_data=f"manage:confirm_delete_user:{user_id}:{offset}"), InlineKeyboardButton("ተወው", callback_data=f"manage:user:{user_id}:{offset}")]]))
+        return
+
+    match = re.fullmatch(r"manage:confirm_delete_user:(\d+):(\d+)", data)
+    if match:
+        user_id, offset = map(int, match.groups())
+        if user_id == context.bot_data["admin_id"]:
+            await query.message.reply_text("የአድሚን መለያ ከዚህ ሊሰረዝ አይችልም።")
+            return
+        with db_session() as db:
+            result = db.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+        audit(query.from_user.id, "delete_user_profile", str(user_id))
+        await query.message.reply_text("✅ የተጠቃሚው የቦት መገለጫ ተሰርዟል። የክፍያ/ትኬት ታሪኩ ግን ተጠብቋል።")
+        await show_admin_users_page(query, offset)
         return
 
     match = re.fullmatch(r"manage:message:(\d+):(\d+)", data)
@@ -2309,60 +2367,81 @@ def number_status_text(state):
     }[state]
 
 
-def public_numbers_keyboard(page, page_count):
-    buttons = []
+def public_numbers_keyboard(page, page_count, range_index=0):
+    rows = []
+    nav = []
     if page > 0:
-        buttons.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"view_numbers:{page - 1}"))
+        nav.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"view_numbers_page:{range_index}:{page - 1}"))
     if page + 1 < page_count:
-        buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"view_numbers:{page + 1}"))
-    return InlineKeyboardMarkup([buttons] if buttons else [])
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"view_numbers_page:{range_index}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    ranges = [(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000)]
+    rows.append([InlineKeyboardButton(f"{a}-{b}", callback_data=f"view_numbers_range:{i}:0") for i,(a,b) in enumerate(ranges)])
+    return InlineKeyboardMarkup(rows)
 
 
-async def show_numbers_and_auto_delete(query, context, page=0):
+async def show_numbers_and_auto_delete(query, context, page=0, range_index=0):
     settings = get_settings()
-    first_number = int(settings["first_number"])
+    configured_first = int(settings["first_number"])
     configured_last = int(settings["last_number"])
+    ranges = [(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000)]
+    range_index = max(0, min(int(range_index), 5))
+    range_first, range_last = ranges[range_index]
+    first_number = max(configured_first, range_first)
+    last_number = min(configured_last, range_last)
+    if first_number > last_number:
+        first_number, last_number = configured_first, configured_last
     page_size = 100
-    page_count = max(1, (configured_last - first_number + page_size) // page_size)
-    page = max(0, min(page, page_count - 1))
+    page_count = max(1, (last_number - first_number + page_size) // page_size)
+    page = max(0, min(int(page), page_count - 1))
     page_start = first_number + page * page_size
-    page_end = min(configured_last, page_start + page_size - 1)
+    page_end = min(last_number, page_start + page_size - 1)
     states = get_number_states(page_start, page_end)
-    lines = [
-        f"<code>{number}</code> {number_status_text(state)}"
-        for number, state in states.items()
-    ]
+    with db_session() as db:
+        sold_rows = db.execute("""
+            SELECT a.number, STRING_AGG(DISTINCT u.display_name, ', ' ORDER BY u.display_name) AS names
+            FROM ticket_allocations a LEFT JOIN users u ON u.user_id=a.user_id
+            WHERE CAST(a.number AS INTEGER) BETWEEN ? AND ?
+            GROUP BY a.number
+        """, (page_start, page_end)).fetchall()
+        reserved_rows = db.execute("""
+            SELECT number, reserved_name FROM blocked_numbers
+            WHERE CAST(number AS INTEGER) BETWEEN ? AND ?
+        """, (page_start, page_end)).fetchall()
+    names = {str(int(r["number"])): (r["names"] or "") for r in sold_rows}
+    reserved = {str(int(r["number"])): (r["reserved_name"] or "") for r in reserved_rows}
+    lines = []
+    compact_status = {"available": "🟢", "half": "🟡", "taken": "🔴"}
+    for number, state in states.items():
+        line = f"{number} {compact_status[state]}"
+        name = names.get(str(number), "") or reserved.get(str(number), "")
+        if name:
+            # Keep 100 entries safely below Telegram's 4096-character message limit.
+            short_name = name[:18] + ("…" if len(name) > 18 else "")
+            line += f" · {html.escape(short_name)}"
+        lines.append(line)
+    # Count numbers sold/remaining from actual allocation state, not admin-entered text.
+    sold = sum(1 for v in states.values() if v in ("half", "taken"))
+    remaining = len(states) - sold
     text = (
-        f"📋 <b>የቁጥሮች ሁኔታ ({page_start}–{page_end})</b>\n"
-        f"🟢 ክፍት  ·  🟡 ግማሽ አለ  ·  🔴 ተይዟል\n\n"
+        f"📋 <b>የቁጥሮች ዝርዝር ({page_start}–{page_end})</b> · {page+1}/{page_count}\n"
+        f"🟢 ክፍት · 🟡 ግማሽ አለ · 🔴 ተይዟል\n"
+        f"በዚህ ገጽ የተሸጡ/የተያዙ፦ {sold} · የቀሩ፦ {remaining}\n\n"
         + "\n".join(lines)
     )
-    markup = public_numbers_keyboard(page, page_count)
-    if query.data and query.data.startswith("view_numbers:"):
-        message = await query.edit_message_text(
-            text=text,
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
+    markup = public_numbers_keyboard(page, page_count, range_index)
+    if query.data and (query.data.startswith("view_numbers:") or query.data.startswith("view_numbers_range:") or query.data.startswith("view_numbers_page:")):
+        message = await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=markup)
     else:
-        message = await query.message.reply_text(
-            text=text,
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
-
+        message = await query.message.reply_text(text=text, parse_mode="HTML", reply_markup=markup)
         async def delete_later(chat_id, message_id):
-            await asyncio.sleep(300)
+            await asyncio.sleep(180)
             try:
-                await context.bot.delete_message(
-                    chat_id=chat_id, message_id=message_id
-                )
+                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
             except TelegramError:
                 logger.info("The temporary number-status message could not be deleted")
-
-        context.application.create_task(
-            delete_later(message.chat_id, message.message_id)
-        )
+        context.application.create_task(delete_later(message.chat_id, message.message_id))
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2422,9 +2501,18 @@ async def show_public_number_report(update, context):
     # Admin-written report fields are shown separately; computed allocation counts are not hand-entered.
     manual=(st.get('public_sales_report') or '').strip()
     # User explicitly chose a manual report: figures and collection amounts are admin-entered.
-    msg=("🔢 <b>የዕጣ ቁጥሮች ሁኔታ / የሽያጭ ሪፖርት</b>\n\n" +
-         (html.escape(manual) if manual else "የሪፖርት መረጃው ገና በአድሚን አልተሞላም።"))
+    remaining=max(0,total-sold)
+    msg=("📊 <b>የሽያጭ ሪፖርት</b>\n\n"+
+         f"በአጠቃላይ የቁጥር መጠን፦ {total}\n"
+         f"በሽያጭ/ምደባ የተያዙ፦ {sold}\n"
+         f"የቀሩ ቁጥሮች፦ {remaining}\n\n"+
+         (html.escape(manual) if manual else "የአድሚን ተጨማሪ ሪፖርት ገና አልተሞላም።"))
     await update.message.reply_text(msg,parse_mode="HTML",reply_markup=main_menu_keyboard())
+    # The detailed 100-number list is a separate temporary message, removed after 3 minutes.
+    class _PublicQuery:
+        data = "view_numbers"
+        message = update.message
+    await show_numbers_and_auto_delete(_PublicQuery(), context, page=0, range_index=0)
 
 async def menu_text_handler(update, context):
     txt=(update.message.text or '').strip()
@@ -2718,7 +2806,7 @@ def main():
     application.add_handler(
         CallbackQueryHandler(
             ticket_chosen,
-            pattern=r"^(ticket:(full|half)|view_numbers(?::\d+)?)$",
+            pattern=r"^(ticket:(full|half)|view_numbers(?::\d+)?|view_numbers_range:\d+:\d+|view_numbers_page:\d+:\d+)$",
         )
     )
     application.add_handler(
