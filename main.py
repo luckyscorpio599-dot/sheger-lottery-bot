@@ -62,7 +62,7 @@ DEFAULT_SETTINGS = {
     "half_ticket_label": "ግማሽ ዕጣ",
     "half_ticket_price": "1250",
     "first_number": "1",
-    "last_number": "6000",
+    "last_number": "9000",
 }
 
 ADMIN_SETTING_FIELDS = {
@@ -487,6 +487,16 @@ def get_settings():
         ).fetchall()
     settings = DEFAULT_SETTINGS.copy()
     settings.update({row["setting_key"]: row["setting_value"] for row in rows})
+    # Existing installations may already have last_number=6000 saved in PostgreSQL.
+    # Upgrade that previous default to 9000 while preserving any other custom range.
+    if str(settings.get("last_number", "")) == "6000":
+        with db_session() as db:
+            db.execute(
+                "INSERT INTO bot_settings (setting_key, setting_value) VALUES (?, ?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+                ("last_number", "9000"),
+            )
+        settings["last_number"] = "9000"
     return settings
 
 
@@ -546,7 +556,7 @@ def bank_details_configured(settings=None):
 
 
 def update_setting(key, value):
-    allowed_feature_settings = {"public_sales_report", "tutorial_file_id", "tutorial_file_type", "tutorial_text"}
+    allowed_feature_settings = {"public_sales_report", "manual_report_total", "manual_report_sold", "manual_report_remaining", "tutorial_file_id", "tutorial_file_type", "tutorial_text"}
     if key not in ADMIN_SETTING_FIELDS and key not in allowed_feature_settings:
         raise ValueError("Unknown setting.")
     with db_session() as db:
@@ -2604,8 +2614,8 @@ def public_numbers_keyboard(page, page_count, range_index=0):
         nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"view_numbers_page:{range_index}:{page + 1}"))
     if nav:
         rows.append(nav)
-    ranges = [(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000)]
-    for start in (0, 3):
+    ranges = [(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000),(6001,7000),(7001,8000),(8001,9000)]
+    for start in (0, 3, 6):
         rows.append([InlineKeyboardButton(f"{ranges[i][0]}-{ranges[i][1]}", callback_data=f"view_numbers_range:{i}:0") for i in range(start, start + 3)])
     return InlineKeyboardMarkup(rows)
 
@@ -2614,8 +2624,8 @@ async def show_numbers_and_auto_delete(query, context, page=0, range_index=0):
     settings = get_settings()
     configured_first = int(settings["first_number"])
     configured_last = int(settings["last_number"])
-    ranges = [(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000)]
-    range_index = max(0, min(int(range_index), 5))
+    ranges = [(1,1000),(1001,2000),(2001,3000),(3001,4000),(4001,5000),(5001,6000),(6001,7000),(7001,8000),(8001,9000)]
+    range_index = max(0, min(int(range_index), len(ranges) - 1))
     range_first, range_last = ranges[range_index]
     first_number = max(configured_first, range_first)
     last_number = min(configured_last, range_last)
@@ -2723,26 +2733,24 @@ async def show_user_tickets(update, context):
     await update.message.reply_text("\n".join(lines),parse_mode="HTML",reply_markup=main_menu_keyboard(is_admin=(update.effective_user.id == context.bot_data.get("admin_id"))))
 
 async def show_public_number_report(update, context):
-    st=get_settings()
-    with db_session() as db:
-        agg=db.execute("""SELECT COUNT(DISTINCT number) AS sold_numbers, COUNT(*) AS sold_slots
-          FROM ticket_allocations""").fetchone()
-        paid=db.execute("""SELECT COALESCE(SUM(CASE WHEN ticket_code='half' THEN CAST(? AS NUMERIC) ELSE CAST(? AS NUMERIC) END),0) AS revenue
-          FROM payments WHERE status='assigned'""",(st['half_ticket_price'],st['full_ticket_price'])).fetchone()
-    first,last=int(st['first_number']),int(st['last_number'])
-    total=last-first+1
-    sold=int(agg['sold_numbers'] or 0)
-    # Admin-written report fields are shown separately; computed allocation counts are not hand-entered.
-    manual=(st.get('public_sales_report') or '').strip()
-    # User explicitly chose a manual report: figures and collection amounts are admin-entered.
-    remaining=max(0,total-sold)
-    msg=("📊 <b>የሽያጭ ሪፖርት</b>\n\n"+
-         f"በአጠቃላይ የቁጥር መጠን፦ {total}\n"
-         f"በሽያጭ/ምደባ የተያዙ፦ {sold}\n"
-         f"የቀሩ ቁጥሮች፦ {remaining}\n\n"+
-         (html.escape(manual) if manual else "የአድሚን ተጨማሪ ሪፖርት ገና አልተሞላም።"))
-    await update.message.reply_text(msg,parse_mode="HTML",reply_markup=main_menu_keyboard(is_admin=(update.effective_user.id == context.bot_data.get("admin_id"))))
-    # The detailed 100-number list is a separate temporary message, removed after 3 minutes.
+    st = get_settings()
+    total = (st.get("manual_report_total") or "").strip()
+    sold = (st.get("manual_report_sold") or "").strip()
+    remaining = (st.get("manual_report_remaining") or "").strip()
+    if total and sold and remaining:
+        msg = (
+            "📊 <b>የሽያጭ ሪፖርት</b>\n\n"
+            f"በአጠቃላይ የቁጥር መጠን፦ {html.escape(total)}\n"
+            f"በሽያጭ/ምደባ የተያዙ፦ {html.escape(sold)}\n"
+            f"የቀሩ ቁጥሮች፦ {html.escape(remaining)}"
+        )
+    else:
+        msg = "📊 <b>የሽያጭ ሪፖርት</b>\n\nየሪፖርቱ መረጃ ገና በአድሚን አልተሞላም።"
+    await update.message.reply_text(
+        msg, parse_mode="HTML",
+        reply_markup=main_menu_keyboard(is_admin=(update.effective_user.id == context.bot_data.get("admin_id")))
+    )
+    # The detailed number-status list remains separate and auto-deletes after 3 minutes.
     class _PublicQuery:
         data = "view_numbers"
         message = update.message
@@ -2846,11 +2854,11 @@ async def v3_callback(update,context):
     if q.data=='v3:broadcast:cancel':
         context.user_data.pop('v3_broadcast_body',None); context.user_data.pop('v3_state',None)
         await q.message.reply_text('Broadcast ተሰርዟል።'); return
-    states={'v3:tutorialtext':'tutorialtext','v3:broadcast':'broadcast','v3:report':'report','v3:winner':'winner','v3:content':'content','v3:settings':'settings'}
+    states={'v3:tutorialtext':'tutorialtext','v3:broadcast':'broadcast','v3:report':'report_total','v3:winner':'winner','v3:content':'content','v3:settings':'settings'}
     if q.data in states:
         context.user_data['v3_state']=states[q.data]
-        prompts={'broadcast':'ለሁሉም ተጠቃሚዎች የሚላከውን ጽሑፍ ይላኩ።','report':'ለተጠቃሚዎች የሚታይ የሪፖርት ጽሑፍ ይላኩ።','winner':'የአሸናፊውን ቁጥር እና ማስታወቂያ በዚህ ቅርጽ ይላኩ፦ 1234 | የውጤት መልእክት','content':'Support ጽሑፍ ይላኩ።','tutorialtext':'Tutorial መመሪያ ጽሑፍ ይላኩ። ፎቶ/ቪዲዮ ለመጫን /tutorialupload ይጠቀሙ፣','settings':'Pending ጊዜ በሰዓት ይላኩ፤ በሚቀጥለው መልእክት የዕጣ ቀን ያስገቡ።'}
-        await q.message.reply_text(prompts[q.data]); return
+        prompts={'broadcast':'ለሁሉም ተጠቃሚዎች የሚላከውን ጽሑፍ ይላኩ።','report':'በአጠቃላይ የቁጥር መጠን (Total tickets) ስንት ነው? ቁጥር ብቻ ያስገቡ።','winner':'የአሸናፊውን ቁጥር እና ማስታወቂያ በዚህ ቅርጽ ይላኩ፦ 1234 | የውጤት መልእክት','content':'Support ጽሑፍ ይላኩ።','tutorialtext':'Tutorial መመሪያ ጽሑፍ ይላኩ። ፎቶ/ቪዲዮ ለመጫን /tutorialupload ይጠቀሙ፣','settings':'Pending ጊዜ በሰዓት ይላኩ፤ በሚቀጥለው መልእክት የዕጣ ቀን ያስገቡ።'}
+        await q.message.reply_text(prompts[q.data.split(':', 1)[1]]); return
 
 async def v3_text_handler(update,context):
     state=context.user_data.get('v3_state'); txt=(update.message.text or '').strip()
@@ -2870,8 +2878,51 @@ async def v3_text_handler(update,context):
         with db_session() as db:
             db.execute("INSERT INTO payment_methods(name,account,holder,instruction) VALUES(?,?,?,?)",(context.user_data.pop('v3_method_name'),context.user_data.pop('v3_method_account'),context.user_data.pop('v3_method_holder'),txt))
         context.user_data.pop('v3_state',None); audit(update.effective_user.id,'add_payment_method',txt[:100]); await update.message.reply_text("✅ አዲሱ የክፍያ አማራጭ ተቀምጧል። ሌላ ባንክ ለመጨመር /adminv3 ይጻፉ።"); return True
-    elif state=='report':
-        update_setting('public_sales_report',txt); context.user_data.pop('v3_state',None); audit(update.effective_user.id,'update_manual_report'); await update.message.reply_text("ሪፖርቱ ተቀምጧል።"); return True
+    elif state in {'report_total', 'report_sold', 'report_remaining'}:
+        if not txt.isascii() or not txt.isdigit():
+            await update.message.reply_text("እባክዎ ቁጥር ብቻ ያስገቡ።")
+            return True
+        value = int(txt)
+        if value < 0 or value > 1000000000:
+            await update.message.reply_text("ትክክለኛ የቁጥር መጠን ያስገቡ።")
+            return True
+        if state == 'report_total':
+            if value < 1:
+                await update.message.reply_text("አጠቃላይ የቁጥር መጠን ከ1 በላይ መሆን አለበት።")
+                return True
+            context.user_data['manual_report_total'] = value
+            context.user_data['v3_state'] = 'report_sold'
+            await update.message.reply_text("በሽያጭ/ምደባ የተያዙት ስንት ናቸው? ቁጥር ብቻ ያስገቡ።")
+            return True
+        if state == 'report_sold':
+            total_value = int(context.user_data.get('manual_report_total', 0))
+            if value > total_value:
+                await update.message.reply_text(f"የተያዙት ቁጥር ከአጠቃላይ ({total_value}) መብለጥ አይችልም። እንደገና ያስገቡ።")
+                return True
+            context.user_data['manual_report_sold'] = value
+            context.user_data['v3_state'] = 'report_remaining'
+            await update.message.reply_text("የቀሩት ቁጥሮች ስንት ናቸው? ቁጥር ብቻ ያስገቡ።")
+            return True
+        total_value = int(context.user_data.get('manual_report_total', 0))
+        sold_value = int(context.user_data.get('manual_report_sold', 0))
+        if value + sold_value != total_value:
+            await update.message.reply_text(
+                f"❌ ሂሳቡ አይገጥምም። {total_value} - {sold_value} = {total_value-sold_value} መሆን አለበት። የቀሩትን እንደገና ያስገቡ።"
+            )
+            return True
+        update_setting('manual_report_total', str(total_value))
+        update_setting('manual_report_sold', str(sold_value))
+        update_setting('manual_report_remaining', str(value))
+        context.user_data.pop('manual_report_total', None)
+        context.user_data.pop('manual_report_sold', None)
+        context.user_data.pop('v3_state', None)
+        audit(update.effective_user.id, 'update_manual_report', f'total={total_value}, sold={sold_value}, remaining={value}')
+        await update.message.reply_text(
+            f"✅ የሽያጭ ሪፖርቱ ተቀምጧል።\n\n"
+            f"በአጠቃላይ፦ {total_value}\nተይዟል፦ {sold_value}\nየቀረው፦ {value}\n\n"
+            "ይህ መረጃ ለተጠቃሚዎች ይታያል።"
+        )
+        return True
     elif state=='broadcast':
         if not txt or len(txt)>4096: await update.message.reply_text('ከ1 እስከ 4096 ቁምፊ ያለው መልእክት ይላኩ።'); return True
         context.user_data['v3_broadcast_body']=txt
